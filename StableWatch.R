@@ -681,3 +681,247 @@ saveRDS(master, master_path)
 message("Master dataframe saved to: ", master_path)
 
 message("Section 2 complete. Master dataframe ready for analysis.")
+
+# ============================================================
+# SECTION 3 — FEATURE ENGINEERING
+# (See Chapter 2: Advanced Data Management)
+# ============================================================
+#
+# Raw price and volume data alone are not enough to detect
+# depeg risk. We need to derive features that capture the
+# signals a risk analyst would actually look for:
+#
+#   1. Peg deviation     — how far is the price from $1.00?
+#   2. Peg deviation Z-score — is the deviation unusual
+#                          relative to the coin's own history?
+#   3. Rolling volatility — is price stability increasing
+#                          or breaking down?
+#   4. Log returns       — for time series and GARCH modeling
+#   5. Volume spike      — is trading volume abnormally high?
+#                          (a key early warning signal)
+#   6. Depeg label       — binary outcome variable: 1 if peg
+#                          deviation exceeds our 0.5% threshold
+#   7. Stress event flag — marks known crisis dates for use
+#                          in model validation and plotting
+#
+# All features are computed per coin using grouped operations
+# so each coin's rolling statistics are self-contained.
+# ============================================================
+
+
+# --- 3.1 Peg Deviation --------------------------------------
+#
+# A stablecoin's fundamental promise is to hold a $1.00 peg.
+# Peg deviation measures how far the daily closing price strays
+# from that target. We use the absolute deviation so that
+# deviations above and below $1.00 are treated equally.
+#
+# peg_dev = |price - 1.00|
+#
+# This is the central variable in our analysis — every model
+# and test downstream uses it directly or as a basis for
+# derived features.
+
+master <- master |>
+  mutate(peg_dev = abs(price - 1.00))
+
+message("Peg deviation computed.")
+message("Max peg deviation overall: ",
+        round(max(master$peg_dev, na.rm = TRUE), 4))
+
+
+# --- 3.2 Log Returns ----------------------------------------
+#
+# Log returns are the standard transformation for financial
+# price series before time series modeling. They are:
+#   - Approximately normally distributed
+#   - Additive across time periods
+#   - Stationary (unlike raw prices)
+#
+# log_return = log(price_t / price_{t-1})
+#
+# We compute them within each coin group so the first
+# observation per coin is NA (no prior price to compare to).
+# (See Chapter 5: Time Series)
+
+master <- master |>
+  group_by(coin) |>
+  arrange(date) |>
+  mutate(log_return = log(price / dplyr::lag(price))) |>
+  ungroup()
+
+message("Log returns computed.")
+message("NA log returns (expected — one per coin): ",
+        sum(is.na(master$log_return)))
+
+
+# --- 3.3 Rolling Volatility ---------------------------------
+#
+# A stablecoin under stress becomes more volatile before it
+# breaks its peg entirely. Rolling volatility captures this
+# buildup and is one of our key early-warning features.
+#
+# We compute two windows:
+#   vol_7d  — 7-day rolling standard deviation of log returns
+#             (short-term noise, responsive to sudden moves)
+#   vol_30d — 30-day rolling standard deviation of log returns
+#             (medium-term trend, smoother signal)
+#
+# We use zoo::rollapply() with fill = NA so early observations
+# that lack a full window are marked NA rather than estimated
+# from insufficient data.
+
+master <- master |>
+  group_by(coin) |>
+  arrange(date) |>
+  mutate(
+    vol_7d  = zoo::rollapply(log_return, width = 7,
+                             FUN = sd, fill = NA,
+                             align = "right", na.rm = TRUE),
+    vol_30d = zoo::rollapply(log_return, width = 30,
+                             FUN = sd, fill = NA,
+                             align = "right", na.rm = TRUE)
+  ) |>
+  ungroup()
+
+message("Rolling volatility computed (7d and 30d).")
+
+
+# --- 3.4 Peg Deviation Z-Score ------------------------------
+#
+# Raw peg deviation tells us the size of the deviation, but
+# not whether it is unusual for that specific coin. A Z-score
+# normalizes peg deviation relative to each coin's own rolling
+# mean and standard deviation over the past 30 days.
+#
+# peg_dev_z = (peg_dev - rolling_mean_30d) / rolling_sd_30d
+#
+# A Z-score above 2 means the current deviation is more than
+# 2 standard deviations above normal for that coin — a strong
+# signal of emerging stress regardless of the coin's baseline
+# volatility level.
+
+master <- master |>
+  group_by(coin) |>
+  arrange(date) |>
+  mutate(
+    roll_mean_30 = zoo::rollapply(peg_dev, width = 30,
+                                  FUN = mean, fill = NA,
+                                  align = "right", na.rm = TRUE),
+    roll_sd_30   = zoo::rollapply(peg_dev, width = 30,
+                                  FUN = sd, fill = NA,
+                                  align = "right", na.rm = TRUE),
+    peg_dev_z    = (peg_dev - roll_mean_30) / roll_sd_30
+  ) |>
+  dplyr::select(-roll_mean_30, -roll_sd_30) |>
+  ungroup()
+
+message("Peg deviation Z-score computed.")
+
+
+# --- 3.5 Volume Spike Indicator -----------------------------
+#
+# Unusual trading volume often precedes or accompanies a depeg
+# event. When market participants sense risk they trade more —
+# either rushing to exit or arbitraging the peg deviation.
+#
+# We define a volume spike as a day where volume exceeds the
+# coin's own 30-day rolling average by more than 2 standard
+# deviations. This is a binary flag (1 = spike, 0 = normal).
+#
+# vol_spike = 1 if volume > (roll_mean_vol + 2 * roll_sd_vol)
+
+master <- master |>
+  group_by(coin) |>
+  arrange(date) |>
+  mutate(
+    roll_mean_vol = zoo::rollapply(volume, width = 30,
+                                   FUN = mean, fill = NA,
+                                   align = "right", na.rm = TRUE),
+    roll_sd_vol   = zoo::rollapply(volume, width = 30,
+                                   FUN = sd, fill = NA,
+                                   align = "right", na.rm = TRUE),
+    vol_spike     = as.integer(
+      volume > (roll_mean_vol + 2 * roll_sd_vol)
+    )
+  ) |>
+  dplyr::select(-roll_mean_vol, -roll_sd_vol) |>
+  ungroup()
+
+message("Volume spike indicator computed.")
+message("Total volume spike days: ", sum(master$vol_spike, na.rm = TRUE))
+
+
+# --- 3.6 Binary Depeg Label ---------------------------------
+#
+# Our classification models need a binary outcome variable.
+# We define a depeg event as any day where peg deviation
+# exceeds our DEPEG_THRESHOLD of 0.5% (set in Section 0).
+#
+# This threshold is consistent with industry practice — most
+# stablecoin risk desks define a depeg as deviation > 0.5%.
+# UST exceeded this threshold on May 9, 2022 and never
+# recovered — making it our primary validation event.
+#
+# depeg = 1 if peg_dev > DEPEG_THRESHOLD, else 0
+
+master <- master |>
+  mutate(depeg = as.integer(peg_dev > DEPEG_THRESHOLD))
+
+message("Depeg label computed.")
+message("Depeg event days by coin:")
+master |>
+  group_by(coin) |>
+  summarise(
+    total_days  = n(),
+    depeg_days  = sum(depeg, na.rm = TRUE),
+    depeg_rate  = round(mean(depeg, na.rm = TRUE) * 100, 2)
+  ) |>
+  print()
+
+
+# --- 3.7 Stress Event Flag ----------------------------------
+#
+# We create a binary flag marking the two known stress events
+# defined in Section 0: the UST collapse (May 9, 2022) and
+# the USDC/SVB scare (March 10, 2023). These flags are used
+# to annotate plots and validate that our models fire around
+# the correct dates.
+
+master <- master |>
+  mutate(
+    stress_event = as.integer(date %in% STRESS_EVENTS$date)
+  )
+
+message("Stress event flags set on: ",
+        paste(STRESS_EVENTS$date, collapse = ", "))
+
+
+# --- 3.8 Review Engineered Features -------------------------
+#
+# We take a final look at the master dataframe to confirm all
+# features were computed correctly before saving.
+
+message("--- Final Master Dataframe Structure ---")
+str(master)
+
+message("--- Feature Summary for USDT (stable reference coin) ---")
+master |>
+  dplyr::filter(coin == "USDT") |>
+  dplyr::select(peg_dev, log_return, vol_7d, vol_30d,
+                peg_dev_z, vol_spike, depeg) |>
+  summary() |>
+  print()
+
+message("--- Feature Summary for UST (collapsed coin) ---")
+master |>
+  dplyr::filter(coin == "UST") |>
+  dplyr::select(peg_dev, log_return, vol_7d, vol_30d,
+                peg_dev_z, vol_spike, depeg) |>
+  summary() |>
+  print()
+
+# Save updated master with engineered features
+saveRDS(master, master_path)
+message("Master dataframe with features saved to: ", master_path)
+message("Section 3 complete. Features ready for analysis.")
