@@ -4120,10 +4120,14 @@ print(p26)
 message("Plot 26 saved: SHAP beeswarm.")
 
 # OBSERVATION: SHAP provides the "why" behind each prediction.
-# We expect vol_7d and peg_dev_z to have the highest importance
-# — consistent with the GLM results in Section 8. High values
-# of these features should push SHAP values positive (toward
-# depeg), while low values should push negative (toward stable).
+# vol_30d is the dominant feature (mean |SHAP| = 3.3) — medium
+# term volatility buildup is the primary depeg signal. peg_dev_z
+# (1.9) and vol_7d (1.6) follow. SOFR and DXY contribute
+# meaningfully, confirming macro conditions matter. vol_spike
+# is near zero — the binary flag adds no information beyond
+# what the continuous volatility features already capture.
+# The beeswarm confirms all three volatility features have clean
+# monotonic effects: high values push toward depeg, low toward stable.
 
 
 # --- 14.5 UST Pre-Collapse Backtest -------------------------
@@ -4198,10 +4202,366 @@ ggsave("output/plots/27_ust_xgb_backtest.png", p27,
 print(p27)
 message("Plot 27 saved: UST XGBoost backtest.")
 
-# OBSERVATION: If the predicted depeg probability for UST
-# spikes above the optimal threshold in the days before
-# May 9, 2022, the model provides genuine early warning.
-# This is the primary answer to the research question —
-# can these signals predict depeg events before they occur?
+# OBSERVATION: The UST backtest directly answers the research
+# question. The model correctly fires on UST's 2021 volatility
+# episodes — predicted probability reaches 100% and crosses
+# the 0.66 threshold repeatedly. This confirms that volatility-
+# based early warning works for gradual stress episodes.
+# However, from late 2021 onward the signal quiets, and the
+# final May 2022 collapse shows near-zero predicted probability
+# in the days immediately before it — consistent with Section
+# 13's finding that the collapse was a sudden bank-run, not a
+# volatility event. The model is a reliable detector of
+# volatility-driven depeg risk but not algorithmic collapse.
 
 message("Section 14 complete. XGBoost + SHAP done.")
+
+# ============================================================
+# SECTION 15 — PERFORMANCE ANALYTICS
+# (See Chapter 7: Advanced Methods — Performance Analytics)
+# ============================================================
+#
+# PerformanceAnalytics is a financial risk package built for
+# evaluating portfolio and strategy performance. Here we use
+# it to analyze the log return distributions of each stablecoin
+# through a risk management lens — computing drawdowns, Value
+# at Risk (VaR), Expected Shortfall (ES), and return statistics
+# that complement the depeg analysis from earlier sections.
+#
+# We treat each stablecoin's log return series as a portfolio
+# and ask: how do the risk profiles compare when measured with
+# standard financial risk metrics?
+# ============================================================
+
+
+# --- 15.1 Prepare Return Time Series ------------------------
+#
+# PerformanceAnalytics works with xts objects. We convert each
+# coin's log return series to xts and combine into a matrix.
+# We use the full date range available for each coin.
+# (See Chapter 7: Advanced Methods — Performance Analytics)
+
+message("--- 15.1 Preparing Return Time Series ---")
+
+# Build xts for each coin
+coins_list <- c("USDC", "USDT", "DAI", "FRAX", "UST")
+
+returns_list <- lapply(coins_list, function(c) {
+  df <- master |>
+    dplyr::filter(coin == c, !is.na(log_return)) |>
+    arrange(date)
+  xts::xts(df$log_return, order.by = df$date)
+})
+names(returns_list) <- coins_list
+
+# Merge all into one xts matrix (dates will align, NAs for gaps)
+returns_xts <- do.call(merge, returns_list)
+colnames(returns_xts) <- coins_list
+
+message("Returns xts dimensions: ", nrow(returns_xts),
+        " rows x ", ncol(returns_xts), " columns")
+message("Date range: ", as.character(start(returns_xts)),
+        " to ", as.character(end(returns_xts)))
+
+# Summary stats via PerformanceAnalytics
+message("Return summary statistics:")
+pa_stats <- PerformanceAnalytics::table.Stats(returns_xts,
+                                              digits = 6)
+print(pa_stats)
+
+
+# --- 15.2 Drawdown Analysis ---------------------------------
+#
+# Drawdown measures the peak-to-trough decline in cumulative
+# returns. For a stablecoin, any sustained drawdown represents
+# a persistent depeg. We use PerformanceAnalytics::table.Drawdowns
+# to identify the worst drawdown episodes for each coin.
+# (See Chapter 7: Performance Analytics — Drawdown Analysis)
+
+message("--- 15.2 Drawdown Analysis ---")
+
+# Plot drawdowns for all coins
+p28 <- PerformanceAnalytics::chart.Drawdown(
+  returns_xts,
+  main    = "Stablecoin Drawdowns from Peak",
+  colorset = c("#2563eb", "#16a34a", "#d97706",
+               "#7c3aed", "#dc2626"),
+  legend.loc = "bottomleft",
+  ylab    = "Drawdown"
+)
+
+# Save via png device since chart.* functions use base R graphics
+png("output/plots/28_drawdowns.png",
+    width = 1200, height = 600, res = 150)
+PerformanceAnalytics::chart.Drawdown(
+  returns_xts,
+  main      = "Stablecoin Drawdowns from Peak",
+  colorset  = c("#2563eb", "#16a34a", "#d97706",
+                "#7c3aed", "#dc2626"),
+  legend.loc = "bottomleft",
+  ylab      = "Drawdown"
+)
+dev.off()
+message("Plot 28 saved: drawdown chart.")
+
+# Table of worst drawdowns per coin
+message("Worst 3 drawdowns per coin:")
+for (c in coins_list) {
+  message("  --- ", c, " ---")
+  dd <- PerformanceAnalytics::table.Drawdowns(
+    returns_xts[, c], top = 3
+  )
+  print(dd)
+}
+
+# OBSERVATION: UST's drawdown will show a single catastrophic
+# drawdown of nearly 100% starting May 2022. USDC will show
+# a brief shallow drawdown in March 2023 (SVB). USDT, DAI,
+# FRAX will show small, short-lived drawdowns from their
+# occasional depegs. The contrast in drawdown depth and
+# duration is the clearest visual summary of the risk
+# differences between the five coins.
+
+
+# --- 15.3 Value at Risk and Expected Shortfall --------------
+#
+# VaR (Value at Risk) answers: what is the maximum loss we
+# would expect on 95% of days? (The loss exceeded only 5%
+# of the time.) Expected Shortfall (ES / CVaR) answers: given
+# that we ARE in the worst 5% of days, what is the average loss?
+# ES is considered a superior risk measure because it captures
+# the severity of tail losses, not just their probability.
+# (See Chapter 7: Performance Analytics — Risk Measures)
+
+message("--- 15.3 Value at Risk and Expected Shortfall ---")
+
+message("Historical VaR (95%) by coin:")
+var_95 <- PerformanceAnalytics::VaR(
+  returns_xts,
+  p      = 0.95,
+  method = "historical"
+)
+print(round(var_95, 6))
+
+message("Expected Shortfall / CVaR (95%) by coin:")
+es_95 <- PerformanceAnalytics::ES(
+  returns_xts,
+  p      = 0.95,
+  method = "historical"
+)
+print(round(es_95, 6))
+
+message("Interpretation:")
+message("  For each coin, VaR and ES quantify tail risk in return")
+message("  space. UST's ES should be the most extreme — on the")
+message("  worst 5% of days, its average loss was catastrophic.")
+message("  USDC and USDT should show near-zero tail risk.")
+
+# OBSERVATION: The VaR/ES comparison provides a standardized
+# risk ranking consistent with everything we've found. It also
+# demonstrates that standard financial risk metrics can be
+# applied to stablecoin data — bridging the gap between
+# traditional portfolio risk management and DeFi.
+
+
+# --- 15.4 Return Distribution Comparison --------------------
+#
+# We use chart.Histogram to visualize the return distributions
+# with normal curve overlay, VaR, and ES marked. This provides
+# a comprehensive view of each coin's risk profile in a single
+# standardized chart.
+
+message("--- 15.4 Return Distribution Summary ---")
+
+png("output/plots/29_return_distributions.png",
+    width = 1800, height = 1200, res = 150)
+par(mfrow = c(2, 3))
+for (c in coins_list) {
+  tryCatch({
+    # Clip extreme returns for plotting only (UST collapse distorts scale)
+    r <- returns_xts[, c]
+    r_clipped <- r[r > quantile(r, 0.005, na.rm = TRUE) &
+                     r < quantile(r, 0.995, na.rm = TRUE)]
+    PerformanceAnalytics::chart.Histogram(
+      r_clipped,
+      main     = paste(c, "Log Return Distribution (99% range)"),
+      methods  = c("add.normal", "add.risk"),
+      colorset = c("#2563eb", "#dc2626", "#d97706"),
+      breaks   = 50
+    )
+  }, error = function(e) {
+    # Fallback: plain histogram if PerformanceAnalytics fails
+    r <- as.numeric(returns_xts[, c])
+    r <- r[!is.na(r)]
+    hist(r, breaks = 50, main = paste(c, "Log Returns"),
+         xlab = "Log Return", col = "#2563eb", border = "white")
+  })
+}
+dev.off()
+message("Plot 29 saved: return distribution histograms.")
+
+message("Section 15 complete. Performance Analytics done.")
+
+
+# ============================================================
+# SECTION 16 — CONCLUSION & INSIGHTS
+# (See Chapter 7: Communicating Results)
+# ============================================================
+#
+# We now synthesize the findings from all 15 sections into a
+# coherent answer to our research question:
+#
+# "Can macroeconomic stress indicators and stablecoin on-chain
+#  behavior predict depeg events before they occur — and did
+#  these signals fire ahead of the UST collapse in May 2022?"
+#
+# The answer is nuanced: yes for volatility-driven stress
+# episodes, no for reflexive algorithmic collapse. We document
+# what worked, what didn't, and why both findings matter.
+# ============================================================
+
+message("--- SECTION 16: CONCLUSION & INSIGHTS ---")
+
+message("")
+message("============================================================")
+message(" STABLEWATCH — RESEARCH FINDINGS SUMMARY")
+message("============================================================")
+message("")
+message("RESEARCH QUESTION:")
+message("  Can macroeconomic and on-chain signals predict stablecoin")
+message("  depeg events before they occur?")
+message("")
+message("------------------------------------------------------------")
+message(" ANSWER 1: YES — for volatility-driven stress episodes")
+message("------------------------------------------------------------")
+message("")
+message("  The XGBoost classifier (AUC=0.9983) trained on USDC,")
+message("  USDT, DAI, and FRAX successfully identifies depeg risk")
+message("  using three leading indicators:")
+message("")
+message("  1. vol_30d (SHAP importance 3.3) — 30-day rolling")
+message("     volatility of log returns. The dominant signal.")
+message("     Rising medium-term volatility precedes depeg events")
+message("     by days to weeks.")
+message("")
+message("  2. peg_dev_z (SHAP importance 1.9) — peg deviation")
+message("     Z-score relative to each coin's own 30-day history.")
+message("     Normalizes for coin-specific baseline, making the")
+message("     signal comparable across stablecoins of different")
+message("     risk profiles.")
+message("")
+message("  3. vol_7d (SHAP importance 1.6) — short-term volatility")
+message("     providing a more responsive signal alongside the")
+message("     slower 30-day window.")
+message("")
+message("  Key evidence:")
+message("  - GLM AUC: 0.6927 (macro only) → 0.9174 (full features)")
+message("  - XGBoost AUC: 0.9983 | Sensitivity: 94.9% | Precision: 94.9%")
+message("  - UST 2021 depegs: model fires correctly, reaching 100%")
+message("    predicted probability on UST's early volatility episodes")
+message("  - Bootstrap CIs: all five coins non-overlapping in mean")
+message("    peg deviation — risk tiers are statistically distinct")
+message("  - PCA confirms macro (PC2) and coin-level stress (PC1)")
+message("    are orthogonal dimensions — both matter independently")
+message("")
+message("------------------------------------------------------------")
+message(" ANSWER 2: NO — for reflexive algorithmic collapse")
+message("------------------------------------------------------------")
+message("")
+message("  UST's final collapse in May 2022 was NOT preceded by")
+message("  the volatility buildup that characterizes ordinary")
+message("  depeg events. The 60-day runup shows:")
+message("")
+message("  - ZERO High Risk cluster days (vs 11.1% baseline)")
+message("  - Near-zero XGBoost predicted probability in final days")
+message("  - Volatility was LOWER than historical average before")
+message("    collapse (deceptively calm)")
+message("")
+message("  The collapse was a reflexive bank-run: UST held its")
+message("  peg with unusually low volatility until May 7-8, then")
+message("  failed instantly as LUNA mint rate spiraled. This is")
+message("  the failure mode described by academic literature on")
+message("  algorithmic stablecoin death spirals.")
+message("")
+message("  Signals that WOULD have detected it (outside scope):")
+message("  - LUNA supply inflation rate (on-chain)")
+message("  - Anchor Protocol deposit outflows (on-chain)")
+message("  - UST/LUNA market cap ratio deterioration")
+message("  - Curve 4pool imbalance (DEX on-chain)")
+message("")
+message("------------------------------------------------------------")
+message(" KEY FINDINGS BY SECTION")
+message("------------------------------------------------------------")
+message("")
+message("  Section 5:  UST statistically riskier than USDC even")
+message("              PRE-collapse (p=0.0048) — risk was visible")
+message("  Section 6:  Rolling vol features 3.6x more predictive")
+message("              than macro variables alone (R²: 0.06→0.23)")
+message("  Section 7:  Bootstrap CIs confirm coin risk tiers are")
+message("              real, not artifacts of non-normality")
+message("  Section 8:  peg_dev_z OR=2.56 — each SD increase in")
+message("              normalized stress multiplies depeg odds 2.56x")
+message("  Section 10: PC1 = coin stress, PC2 = macro conditions —")
+message("              two orthogonal, independently useful signals")
+message("  Section 11: GARCH beta1=0.881 — extreme volatility")
+message("              persistence in UST, structural break confirmed")
+message("  Section 13: Cluster model correctly flags UST 2021 depegs;")
+message("              fails on 2022 collapse — confirms bank-run")
+message("              nature of algorithmic stablecoin failure")
+message("  Section 14: XGBoost SHAP confirms vol_30d > peg_dev_z >")
+message("              vol_7d >> macro features in importance")
+message("")
+message("------------------------------------------------------------")
+message(" LIMITATIONS & FUTURE WORK")
+message("------------------------------------------------------------")
+message("")
+message("  1. Price-only scope: on-chain reserve data (LUNA supply,")
+message("     Anchor deposits, DEX pool balance) would enable")
+message("     detection of algorithmic collapse risk")
+message("")
+message("  2. Single collapse event: UST is the only algorithmic")
+message("     stablecoin collapse in our dataset. More collapse")
+message("     events (e.g. IRON Finance, FRAX partial depeg)")
+message("     would improve generalization")
+message("")
+message("  3. Temporal leakage risk: rolling features use past")
+message("     data only (right-aligned windows) — no look-ahead")
+message("     bias, but model trained on 2020-2023 may not")
+message("     generalize to future market regimes")
+message("")
+message("  4. vol_spike feature: SHAP shows near-zero importance —")
+message("     binary volume flag adds nothing beyond continuous")
+message("     volatility features. Would drop in production model.")
+message("")
+message("============================================================")
+message(" END OF STABLEWATCH ANALYSIS")
+message("============================================================")
+
+# Save final summary table
+final_summary <- data.frame(
+  Section   = c("5", "6", "7", "8", "10", "11", "13", "14"),
+  Method    = c("t-test/Shapiro/Levene/Wilcoxon",
+                "Linear Regression / Welch ANOVA",
+                "Bootstrap (2000 resamples)",
+                "Logistic GLM",
+                "PCA",
+                "ARIMA + GARCH",
+                "K-Means Clustering",
+                "XGBoost + SHAP"),
+  Key_Finding = c(
+    "UST riskier than USDC pre-collapse (p=0.0048)",
+    "Vol features 3.6x more predictive than macro alone",
+    "All coin CIs non-overlapping — risk tiers are real",
+    "GLM AUC 0.69 (macro) → 0.92 (full features)",
+    "PC1=coin stress, PC2=macro — orthogonal dimensions",
+    "GARCH beta1=0.881, extreme volatility persistence",
+    "2021 depegs detected; 2022 collapse missed (bank-run)",
+    "XGBoost AUC=0.9983, vol_30d dominant (SHAP=3.3)"
+  )
+)
+
+write.csv(final_summary, "output/tables/final_summary.csv",
+          row.names = FALSE)
+message("Final summary table saved.")
+
+message("StableWatch analysis complete.")
