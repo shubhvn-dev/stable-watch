@@ -1,0 +1,7 @@
+data/raw/
+data/processed/
+output/models/
+.Rhistory
+.RData
+.Rproj.user
+*.Rproj
