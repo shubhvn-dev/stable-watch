@@ -1994,3 +1994,228 @@ message("Plot 8 saved: bootstrap CI for depeg rate.")
 # stable, after collapse it was permanently depegged.
 
 message("Section 7 complete. Bootstrapping done.")
+
+# ============================================================
+# SECTION 8 — GLM / LOGISTIC REGRESSION
+# (See Chapter 4: Generalized Linear Models)
+# ============================================================
+#
+# Linear regression in Section 6 modeled peg deviation as a
+# continuous outcome. But our research question is ultimately
+# about prediction: can we predict WHEN a depeg event occurs?
+#
+# A depeg event is binary (1 = depegged, 0 = stable), which
+# makes logistic regression the natural choice. Logistic
+# regression is a Generalized Linear Model (GLM) with a
+# binomial family and logit link function. It models the
+# log-odds of a depeg event as a linear combination of
+# our predictor variables.
+#
+# We fit two models:
+#   Model 1: Macro-only — DXY, SOFR, VIX
+#   Model 2: Full — macro + rolling volatility features
+#
+# We evaluate both using ROC curves and AUC, and interpret
+# the odds ratios to understand which features drive depeg risk.
+# ============================================================
+
+
+# --- 8.1 Prepare Logistic Regression Data -------------------
+#
+# We use the full master dataframe but exclude rows with NA
+# in any feature we plan to use. We also exclude the UST
+# post-collapse period (after May 9, 2022) to avoid the model
+# being dominated by a single catastrophic event.
+# The post-collapse period will be used for out-of-sample
+# validation in Section 14.
+
+message("--- 8.1 Preparing Logistic Regression Data ---")
+
+glm_data <- master |>
+  dplyr::filter(
+    !(coin == "UST" & date >= as.Date("2022-05-09")),
+    !is.na(depeg),
+    !is.na(vol_7d),
+    !is.na(vol_30d),
+    !is.na(peg_dev_z),
+    !is.na(dxy),
+    !is.na(sofr),
+    !is.na(vix)
+  ) |>
+  mutate(depeg = factor(depeg, levels = c(0, 1),
+                        labels = c("stable", "depeg")))
+
+message("GLM data: ", nrow(glm_data), " rows")
+message("Depeg class balance:")
+print(table(glm_data$depeg))
+message("Depeg rate: ",
+        round(mean(glm_data$depeg == "depeg") * 100, 2), "%")
+
+
+# --- 8.2 GLM Model 1: Macro Predictors Only -----------------
+#
+# We first fit a logistic regression using only the three
+# macro variables. This gives us a baseline to compare against
+# the full feature model and tests whether macro conditions
+# alone can predict depeg events.
+#
+# The logit link function models:
+#   log(P(depeg) / P(stable)) = b0 + b1*dxy + b2*sofr + b3*vix
+#
+# Positive coefficients increase the log-odds of a depeg.
+# We exponentiate to get odds ratios for interpretation.
+# (See Chapter 4: Generalized Linear Models — Logistic Regression)
+
+message("--- 8.2 GLM Model 1: Macro Predictors ---")
+
+glm_macro <- glm(depeg ~ dxy + sofr + vix,
+                 data   = glm_data,
+                 family = binomial(link = "logit"))
+
+message("GLM 1 summary:")
+print(summary(glm_macro))
+
+message("Odds Ratios (exp(coef)):")
+odds_macro <- exp(cbind(OR = coef(glm_macro),
+                        confint(glm_macro, level = 0.95)))
+print(round(odds_macro, 4))
+
+saveRDS(glm_macro, "output/models/glm_macro.rds")
+
+# OBSERVATION: An odds ratio > 1 for VIX means higher market
+# fear increases the odds of a depeg event. An OR < 1 for DXY
+# means a stronger dollar is associated with lower depeg odds —
+# which is consistent with stablecoins being denominated in USD.
+
+
+# --- 8.3 GLM Model 2: Full Feature Set ----------------------
+#
+# We add the rolling volatility features and peg deviation
+# Z-score to the macro predictors. These coin-level signals
+# should substantially improve predictive power since they
+# directly measure peg stress at the coin level.
+
+message("--- 8.3 GLM Model 2: Full Feature Set ---")
+
+glm_full <- glm(depeg ~ dxy + sofr + vix + vol_7d + vol_30d + peg_dev_z,
+                data   = glm_data,
+                family = binomial(link = "logit"))
+
+message("GLM 2 summary:")
+print(summary(glm_full))
+
+message("Odds Ratios (exp(coef)):")
+odds_full <- exp(cbind(OR = coef(glm_full),
+                       confint(glm_full, level = 0.95)))
+print(round(odds_full, 4))
+
+saveRDS(glm_full, "output/models/glm_full.rds")
+
+message("AIC comparison:")
+message("  GLM macro (macro only) AIC: ", round(AIC(glm_macro), 1))
+message("  GLM full  (all features) AIC: ", round(AIC(glm_full), 1))
+message("  Lower AIC = better model fit penalized for complexity.")
+
+
+# --- 8.4 ROC Curves and AUC ---------------------------------
+#
+# The ROC (Receiver Operating Characteristic) curve plots the
+# true positive rate against the false positive rate across all
+# classification thresholds. AUC (Area Under the Curve) summarizes
+# the model's ability to discriminate between depeg and stable days.
+#
+#   AUC = 0.5 → random guessing
+#   AUC = 1.0 → perfect discrimination
+#   AUC > 0.7 → considered acceptable for risk models
+#
+# (See Chapter 4: Generalized Linear Models — Model Evaluation)
+
+message("--- 8.4 ROC Curves and AUC ---")
+
+# Predicted probabilities from both models
+pred_macro <- predict(glm_macro, type = "response")
+pred_full  <- predict(glm_full,  type = "response")
+
+# Convert depeg factor back to numeric for pROC
+depeg_numeric <- as.integer(glm_data$depeg == "depeg")
+
+roc_macro <- pROC::roc(depeg_numeric, pred_macro, quiet = TRUE)
+roc_full  <- pROC::roc(depeg_numeric, pred_full,  quiet = TRUE)
+
+message("AUC — GLM macro (macro only): ",
+        round(pROC::auc(roc_macro), 4))
+message("AUC — GLM full  (all features): ",
+        round(pROC::auc(roc_full), 4))
+
+# Plot ROC curves for both models
+roc_df <- bind_rows(
+  data.frame(
+    fpr   = 1 - roc_macro$specificities,
+    tpr   = roc_macro$sensitivities,
+    model = paste0("Macro only (AUC = ",
+                   round(pROC::auc(roc_macro), 3), ")")
+  ),
+  data.frame(
+    fpr   = 1 - roc_full$specificities,
+    tpr   = roc_full$sensitivities,
+    model = paste0("Full features (AUC = ",
+                   round(pROC::auc(roc_full), 3), ")")
+  )
+)
+
+p9 <- ggplot(roc_df, aes(x = fpr, y = tpr, color = model)) +
+  geom_line(linewidth = 0.8) +
+  geom_abline(slope = 1, intercept = 0,
+              linetype = "dashed", color = "gray50") +
+  scale_color_manual(values = c("#2563eb", "#dc2626")) +
+  labs(
+    title    = "ROC Curves: Logistic Regression Models",
+    subtitle = "Dashed line = random classifier (AUC = 0.5)",
+    x        = "False Positive Rate (1 - Specificity)",
+    y        = "True Positive Rate (Sensitivity)",
+    color    = "Model"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(legend.position = "bottom")
+
+ggsave("output/plots/09_roc_curves_glm.png", p9,
+       width = 7, height = 6, dpi = 150)
+print(p9)
+
+message("Plot 9 saved: ROC curves.")
+
+# OBSERVATION: The jump in AUC from the macro-only model to the
+# full feature model quantifies how much our engineered features
+# (vol_7d, vol_30d, peg_dev_z) improve predictive power beyond
+# what macro conditions alone provide. This directly answers
+# part of our research question.
+
+
+# --- 8.5 Confusion Matrix at Default Threshold --------------
+#
+# We evaluate the full model at the default 0.5 classification
+# threshold to get precision, recall, and accuracy. In a risk
+# context, recall (sensitivity) matters most — missing a real
+# depeg event is worse than a false alarm.
+
+message("--- 8.5 Confusion Matrix: GLM Full Model ---")
+
+pred_class <- ifelse(pred_full >= 0.5, "depeg", "stable")
+pred_class <- factor(pred_class, levels = c("stable", "depeg"))
+
+cm <- caret::confusionMatrix(pred_class, glm_data$depeg,
+                             positive = "depeg")
+print(cm)
+
+message("Interpretation:")
+message("  Sensitivity (recall): ",
+        round(cm$byClass["Sensitivity"], 4),
+        " — of all true depeg days, what fraction did we catch?")
+message("  Specificity: ",
+        round(cm$byClass["Specificity"], 4),
+        " — of all stable days, what fraction did we correctly")
+message("    identify as stable?")
+message("  In a risk context, high sensitivity is critical —")
+message("  missing a depeg event is costlier than a false alarm.")
+
+message("Section 8 complete. GLM / Logistic Regression done.")
