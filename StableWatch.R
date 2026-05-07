@@ -1528,3 +1528,219 @@ if (wilcox_result$p.value < 0.05) {
 # fundamentally different in their risk profiles.
 
 message("Section 5 complete. Statistical tests done.")
+
+# ============================================================
+# SECTION 6 — REGRESSION & ANOVA
+# (See Chapter 3: Regression; Chapter 3: Analysis of Variance)
+# ============================================================
+#
+# We now move from describing the data to modeling it. This
+# section addresses two related questions:
+#
+#   1. REGRESSION: Do macroeconomic stress indicators (DXY,
+#      SOFR, VIX) predict peg deviation? If macro conditions
+#      drive stablecoin stress, we should see significant
+#      coefficients in a linear regression of peg_dev on
+#      our FRED variables.
+#
+#   2. ANOVA: Is there a statistically significant difference
+#      in mean peg deviation across the five coins? This tests
+#      whether coin type itself is a meaningful risk factor —
+#      which it clearly should be given our EDA, but we
+#      confirm it formally here.
+#
+# Levene's test in Section 5 confirmed unequal variances across
+# coins, so we use Welch's ANOVA (oneway.test) which relaxes
+# the homoscedasticity assumption.
+# ============================================================
+
+
+# --- 6.1 Linear Regression: Macro Predictors of Peg Deviation
+#
+# We regress peg deviation on our three macro variables to test
+# whether broader financial market conditions predict stablecoin
+# stress. The intuition is:
+#   - Higher VIX (fear) → more crypto market stress → larger
+#     peg deviations
+#   - Higher DXY (stronger dollar) → tighter financial conditions
+#     → potential stablecoin outflows and peg pressure
+#   - Higher SOFR (interest rates) → higher opportunity cost
+#     of holding stablecoins → potential peg pressure
+#
+# We exclude UST post-collapse from this regression since those
+# extreme values would dominate the fit. We model the "normal"
+# stablecoin world and test whether macro signals matter there.
+#
+# (See Chapter 3: Regression — Linear Models)
+
+message("--- 6.1 Linear Regression: Macro Predictors of Peg Deviation ---")
+
+# Exclude UST collapse period for a clean regression
+reg_data <- master |>
+  dplyr::filter(
+    !(coin == "UST" & date >= as.Date("2022-05-09")),
+    !is.na(peg_dev),
+    !is.na(dxy),
+    !is.na(sofr),
+    !is.na(vix)
+  )
+
+lm_macro <- lm(peg_dev ~ dxy + sofr + vix, data = reg_data)
+
+message("Linear regression: peg_dev ~ dxy + sofr + vix")
+print(summary(lm_macro))
+
+message("Interpretation:")
+message("  R-squared   : ", round(summary(lm_macro)$r.squared, 4))
+message("  Adj R-squared: ", round(summary(lm_macro)$adj.r.squared, 4))
+
+coefs <- summary(lm_macro)$coefficients
+for (var in c("dxy", "sofr", "vix")) {
+  p <- coefs[var, "Pr(>|t|)"]
+  est <- coefs[var, "Estimate"]
+  sig <- ifelse(p < 0.001, "***",
+                ifelse(p < 0.01, "**",
+                       ifelse(p < 0.05, "*", "not significant")))
+  message("  ", var, ": coef = ", round(est, 6),
+          ", p = ", round(p, 4), " ", sig)
+}
+
+message("  Low R-squared is expected — macro variables alone")
+message("  do not fully explain peg deviation. Their significance")
+message("  tells us whether they contain signal, even if weak.")
+
+# Save model
+saveRDS(lm_macro, "output/models/lm_macro.rds")
+
+# OBSERVATION: A low but significant R-squared here is actually
+# the ideal finding — it means macro variables have predictive
+# signal but are not the whole story. This motivates adding
+# coin-level features (vol_7d, peg_dev_z, vol_spike) in the
+# classification model in Section 14.
+
+
+# --- 6.2 Linear Regression: Coin-Level Features -------------
+#
+# We extend the regression to include our engineered features
+# alongside the macro variables. This tests whether rolling
+# volatility and peg deviation Z-score add predictive power
+# beyond what macro conditions alone provide.
+#
+# We use the complete feature set available in the master
+# dataframe, excluding rows with NA in rolling features
+# (the first 30 days per coin where rolling windows are empty).
+
+message("--- 6.2 Linear Regression: Full Feature Set ---")
+
+reg_data_full <- master |>
+  dplyr::filter(
+    !(coin == "UST" & date >= as.Date("2022-05-09")),
+    !is.na(peg_dev),
+    !is.na(vol_7d),
+    !is.na(vol_30d),
+    !is.na(peg_dev_z),
+    !is.na(dxy),
+    !is.na(sofr),
+    !is.na(vix)
+  )
+
+lm_full <- lm(peg_dev ~ dxy + sofr + vix + vol_7d + vol_30d,
+              data = reg_data_full)
+
+message("Linear regression: peg_dev ~ dxy + sofr + vix + vol_7d + vol_30d")
+print(summary(lm_full))
+
+message("Interpretation:")
+message("  R-squared    : ", round(summary(lm_full)$r.squared, 4))
+message("  Adj R-squared: ", round(summary(lm_full)$adj.r.squared, 4))
+message("  Adding rolling volatility features improves fit")
+message("  compared to macro variables alone (R2 = ",
+        round(summary(lm_macro)$r.squared, 4), " vs ",
+        round(summary(lm_full)$r.squared, 4), ").")
+
+saveRDS(lm_full, "output/models/lm_full.rds")
+
+# OBSERVATION: The comparison between lm_macro and lm_full
+# directly shows whether our engineered features add value.
+# If R-squared increases substantially, it confirms that
+# coin-level volatility signals matter beyond macro conditions —
+# supporting their inclusion in our XGBoost model.
+
+
+# --- 6.3 Welch's ANOVA: Peg Deviation Across Coins ----------
+#
+# We test whether mean peg deviation differs significantly
+# across the five coins. This is a formal test of whether
+# coin type is a meaningful risk factor.
+#
+# H0: all five coins have the same mean peg deviation
+# H1: at least one coin has a different mean peg deviation
+#
+# We use Welch's ANOVA (oneway.test with var.equal = FALSE)
+# because Levene's test in Section 5 confirmed unequal
+# variances — standard ANOVA would be inappropriate here.
+# (See Chapter 3: Analysis of Variance)
+
+message("--- 6.3 Welch's ANOVA: Peg Deviation Across Coins ---")
+
+anova_result <- oneway.test(peg_dev ~ coin,
+                            data      = master,
+                            var.equal = FALSE)
+
+print(anova_result)
+
+message("Interpretation:")
+message("  F = ", round(anova_result$statistic, 2),
+        ", df1 = ", round(anova_result$parameter[1], 1),
+        ", df2 = ", round(anova_result$parameter[2], 1),
+        ", p = ", format(anova_result$p.value, scientific = TRUE))
+
+if (anova_result$p.value < 0.05) {
+  message("  p < 0.05: We REJECT H0.")
+  message("  Mean peg deviation differs significantly across coins.")
+  message("  Coin type is a meaningful risk factor — not all")
+  message("  stablecoins carry the same level of peg risk.")
+} else {
+  message("  p >= 0.05: We FAIL TO REJECT H0.")
+  message("  No significant difference in mean peg deviation.")
+}
+
+# OBSERVATION: A significant ANOVA result confirms what our EDA
+# showed visually — coins are not interchangeable in terms of
+# peg risk. This justifies running coin-specific models and
+# treating coin identity as a feature in classification.
+
+
+# --- 6.4 Post-Hoc Pairwise Comparison -----------------------
+#
+# When ANOVA rejects H0, we need a post-hoc test to identify
+# WHICH coins differ from each other. We use pairwise Wilcoxon
+# tests with Bonferroni correction for multiple comparisons.
+# Bonferroni is conservative but appropriate given the
+# non-normality confirmed in Section 5.
+#
+# (See Chapter 3: Analysis of Variance — Post-Hoc Tests)
+
+message("--- 6.4 Post-Hoc Pairwise Wilcoxon Tests (Bonferroni) ---")
+
+pairwise_result <- pairwise.wilcox.test(
+  master$peg_dev,
+  master$coin,
+  p.adjust.method = "bonferroni",
+  exact           = FALSE
+)
+
+print(pairwise_result)
+
+message("Interpretation:")
+message("  Pairs with p < 0.05 have significantly different")
+message("  peg deviation distributions after Bonferroni correction.")
+message("  This tells us which specific coin pairs are statistically")
+message("  distinguishable in terms of peg risk.")
+
+# OBSERVATION: The pairwise comparisons complete the ANOVA story.
+# We expect UST to differ significantly from all other coins,
+# and potentially DAI/FRAX to differ from USDC/USDT given their
+# elevated depeg rates observed in Sections 3 and 4.
+
+message("Section 6 complete. Regression and ANOVA done.")
