@@ -1283,3 +1283,248 @@ message("Plot 6 saved: volume time series.")
 # supports its inclusion in the classification model.
 
 message("Section 4 complete. EDA and basic graphs done.")
+
+# ============================================================
+# SECTION 5 — STATISTICAL TESTS
+# (See Chapter 3: Basic Statistics — Statistical Tests)
+# ============================================================
+#
+# Our EDA established that peg deviation distributions are
+# highly non-normal, right-skewed, and heavy-tailed across
+# all coins. Before modeling, we formally test the hypotheses
+# that motivate our analytical choices:
+#
+#   Test 1: Two-sample t-test — is UST's mean peg deviation
+#           significantly different from USDC's pre-collapse?
+#
+#   Test 2: Shapiro-Wilk normality test — are peg deviations
+#           normally distributed? (motivates non-parametric
+#           approaches in later sections)
+#
+#   Test 3: Levene's test — do the five coins have equal
+#           variance in peg deviation? (tests homogeneity
+#           of variance assumption for ANOVA in Section 6)
+#
+#   Test 4: Wilcoxon rank-sum test — non-parametric comparison
+#           of peg deviation between coins, appropriate given
+#           the non-normality confirmed by Test 2
+#
+# Each test result is interpreted in plain English immediately
+# after it runs — not just p-values, but what they mean for
+# our analysis and research question.
+# ============================================================
+
+
+# --- 5.1 Two-Sample T-Test: UST vs USDC Pre-Collapse --------
+#
+# We compare the mean peg deviation of UST and USDC during the
+# period BEFORE the collapse (before May 9, 2022). If the two
+# coins were statistically indistinguishable before the event,
+# it strengthens the argument that the collapse was a discrete
+# structural break rather than a gradual trend — and makes the
+# case that early-warning signals are necessary.
+#
+# H0: mean(peg_dev_UST) == mean(peg_dev_USDC) pre-collapse
+# H1: mean(peg_dev_UST) != mean(peg_dev_USDC) pre-collapse
+#
+# (See Chapter 3: Basic Statistics — t-tests)
+
+pre_collapse <- as.Date("2022-05-09")
+
+ust_pre  <- master |>
+  dplyr::filter(coin == "UST",  date < pre_collapse) |>
+  pull(peg_dev)
+
+usdc_pre <- master |>
+  dplyr::filter(coin == "USDC", date < pre_collapse) |>
+  pull(peg_dev)
+
+t_test_result <- t.test(ust_pre, usdc_pre,
+                        alternative = "two.sided",
+                        var.equal   = FALSE)   # Welch's t-test
+
+message("--- Test 1: Two-Sample Welch T-Test (UST vs USDC pre-collapse) ---")
+print(t_test_result)
+
+message("Interpretation:")
+message("  UST mean peg deviation pre-collapse : ",
+        round(mean(ust_pre, na.rm = TRUE), 6))
+message("  USDC mean peg deviation pre-collapse: ",
+        round(mean(usdc_pre, na.rm = TRUE), 6))
+if (t_test_result$p.value < 0.05) {
+  message("  p = ", round(t_test_result$p.value, 4),
+          " < 0.05: We REJECT H0. UST and USDC had significantly",
+          " different mean peg deviations even before the collapse.")
+  message("  This suggests UST carried elevated baseline risk",
+          " that was visible in the data before May 2022.")
+} else {
+  message("  p = ", round(t_test_result$p.value, 4),
+          " >= 0.05: We FAIL TO REJECT H0. UST and USDC were",
+          " statistically similar before the collapse.")
+  message("  This supports the case that early-warning signals",
+          " are needed — the collapse was not obvious in mean deviation.")
+}
+
+# OBSERVATION: The pre-collapse comparison tells us whether
+# UST's risk was already visible in the price data before the
+# event. This directly answers our research question about
+# whether signals fire ahead of a depeg.
+
+
+# --- 5.2 Shapiro-Wilk Normality Test ------------------------
+#
+# The Shapiro-Wilk test formally tests whether a sample comes
+# from a normally distributed population. Our EDA showed heavy
+# skewness and kurtosis — this test confirms it statistically.
+#
+# H0: peg_dev is normally distributed
+# H1: peg_dev is not normally distributed
+#
+# We test each coin separately using a sample of 500
+# observations (Shapiro-Wilk requires n < 5000 and becomes
+# almost always significant for very large samples).
+#
+# (See Chapter 3: Basic Statistics — Normality Tests)
+
+message("--- Test 2: Shapiro-Wilk Normality Test by Coin ---")
+
+set.seed(42)
+shapiro_results <- master |>
+  group_by(coin) |>
+  summarise(
+    n         = n(),
+    statistic = {
+      samp <- sample(peg_dev[!is.na(peg_dev)],
+                     min(500, sum(!is.na(peg_dev))))
+      shapiro.test(samp)$statistic
+    },
+    p_value   = {
+      samp <- sample(peg_dev[!is.na(peg_dev)],
+                     min(500, sum(!is.na(peg_dev))))
+      shapiro.test(samp)$p.value
+    },
+    normal    = ifelse(p_value >= 0.05, "Yes", "No")
+  )
+
+print(shapiro_results)
+
+message("Interpretation:")
+message("  All coins with p < 0.05 have non-normal peg deviation.")
+message("  This confirms what EDA showed — the distributions are")
+message("  heavily right-skewed and not appropriate for methods")
+message("  that assume normality. We use non-parametric alternatives")
+message("  (Wilcoxon test below, bootstrapping in Section 7).")
+
+# OBSERVATION: Non-normality is confirmed statistically for all
+# coins. This is expected for financial data — returns and
+# deviations cluster near zero with fat tails. The confirmation
+# here validates our modeling choices downstream.
+
+
+# --- 5.3 Levene's Test — Equality of Variance ---------------
+#
+# Before running ANOVA in Section 6, we test whether the five
+# coins have equal variance in peg deviation. ANOVA assumes
+# homogeneity of variance (homoscedasticity). If this assumption
+# is violated, we use Welch's ANOVA instead.
+#
+# H0: all five coins have equal variance in peg_dev
+# H1: at least one coin has different variance
+#
+# We use Levene's test (from the car package) which is more
+# robust to non-normality than Bartlett's test.
+# (See Chapter 3: Analysis of Variance)
+
+message("--- Test 3: Levene's Test for Equality of Variance ---")
+
+levene_result <- car::leveneTest(peg_dev ~ coin,
+                                 data   = master,
+                                 center = median)
+
+print(levene_result)
+
+message("Interpretation:")
+if (levene_result$`Pr(>F)`[1] < 0.05) {
+  message("  p = ", round(levene_result$`Pr(>F)`[1], 6),
+          " < 0.05: We REJECT H0.")
+  message("  The five coins do NOT have equal variance.")
+  message("  We will use Welch's ANOVA in Section 6, which does")
+  message("  not assume equal variances across groups.")
+} else {
+  message("  p >= 0.05: We FAIL TO REJECT H0.")
+  message("  Variances are homogeneous — standard ANOVA is appropriate.")
+}
+
+# OBSERVATION: Given UST's dramatically higher variance (std dev
+# of 0.397 vs USDT's 0.002), we fully expect Levene's test to
+# reject H0. This is not a problem — it informs our modeling
+# choice and demonstrates we are testing assumptions rigorously.
+
+
+# --- 5.4 Wilcoxon Rank-Sum Test: UST vs USDT ----------------
+#
+# Given the confirmed non-normality, we use the Wilcoxon
+# rank-sum test (Mann-Whitney U) as a non-parametric alternative
+# to the t-test for comparing peg deviation between two coins.
+#
+# We compare UST vs USDT across their overlapping date range —
+# the two extreme cases in our dataset (collapsed vs stable).
+#
+# H0: peg_dev distributions of UST and USDT are identical
+# H1: one distribution is stochastically greater than the other
+#
+# (See Chapter 4: Resampling Statistics — Non-parametric Tests)
+
+message("--- Test 4: Wilcoxon Rank-Sum Test (UST vs USDT) ---")
+
+# Find overlapping date range
+overlap_start <- max(
+  min(master$date[master$coin == "UST"],  na.rm = TRUE),
+  min(master$date[master$coin == "USDT"], na.rm = TRUE)
+)
+overlap_end <- min(
+  max(master$date[master$coin == "UST"],  na.rm = TRUE),
+  max(master$date[master$coin == "USDT"], na.rm = TRUE)
+)
+
+ust_peg  <- master |>
+  dplyr::filter(coin == "UST",
+                date >= overlap_start,
+                date <= overlap_end) |>
+  pull(peg_dev)
+
+usdt_peg <- master |>
+  dplyr::filter(coin == "USDT",
+                date >= overlap_start,
+                date <= overlap_end) |>
+  pull(peg_dev)
+
+wilcox_result <- wilcox.test(ust_peg, usdt_peg,
+                             alternative = "greater",
+                             exact       = FALSE)
+
+print(wilcox_result)
+
+message("Interpretation:")
+message("  Overlapping period: ", overlap_start, " to ", overlap_end)
+message("  UST median peg deviation : ",
+        round(median(ust_peg, na.rm = TRUE), 6))
+message("  USDT median peg deviation: ",
+        round(median(usdt_peg, na.rm = TRUE), 6))
+if (wilcox_result$p.value < 0.05) {
+  message("  p = ", round(wilcox_result$p.value, 6),
+          " < 0.05: We REJECT H0.")
+  message("  UST's peg deviation is stochastically greater than USDT's.")
+  message("  Even when including the pre-collapse stable period,")
+  message("  UST carried significantly higher peg risk than USDT.")
+} else {
+  message("  p >= 0.05: We FAIL TO REJECT H0.")
+}
+
+# OBSERVATION: The Wilcoxon test is appropriate here because
+# (a) peg deviation is non-normal and (b) we are comparing
+# ordinal risk levels rather than assuming equal distributions.
+# A significant result here tells us the coins are
+# fundamentally different in their risk profiles.
+
+message("Section 5 complete. Statistical tests done.")
