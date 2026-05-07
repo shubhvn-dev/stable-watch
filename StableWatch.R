@@ -1,5 +1,6 @@
 # ============================================================
 # StableWatch: Stablecoin Depeg Risk Monitor
+# Shubhan Kadam | sk12159
 # FRE 6871 — Final Project
 # ============================================================
 #
@@ -63,13 +64,13 @@ packages <- c(
   "httr2",          # Modern HTTP requests for CoinGecko API
   "jsonlite",       # Parse JSON responses from APIs
   "fredr",          # FRED API wrapper
-  
+
   # Data manipulation
   "tidyverse",      # Core data wrangling (dplyr, tidyr, purrr)
   "lubridate",      # Date/time handling
   "zoo",            # Rolling calculations and time series tools
   "xts",            # Extensible time series objects
-  
+
   # Statistics & modeling
   "moments",        # Skewness and kurtosis
   "car",            # Levene's test, ANOVA utilities
@@ -78,23 +79,23 @@ packages <- c(
   "rugarch",        # GARCH modeling
   "mice",           # Multiple imputation for missing data
   "naniar",         # Visualize missing data patterns
-  
+
   # Machine learning
   "xgboost",        # XGBoost classification
   "caret",          # Train/test split, confusion matrix
   "pROC",           # ROC curves and AUC
   "shapviz",        # SHAP explainability for XGBoost
-  
+
   # Dimensionality reduction
   "factoextra",     # PCA visualization (scree plot, biplot)
-  
+
   # Clustering
   "cluster",        # K-means and cluster diagnostics
-  
+
   # Performance analytics
   "PerformanceAnalytics",  # Financial performance metrics
   "quantmod",              # Download financial data
-  
+
   # Visualization
   "ggplot2",        # Core plotting (part of tidyverse)
   "ggcorrplot",     # Correlation heatmaps
@@ -247,7 +248,7 @@ FRED_SERIES <- c(
   "DTWEXBGS",  # DXY — Nominal Broad US Dollar Index
   "SOFR",      # SOFR — Secured Overnight Financing Rate
   "VIXCLS"     # VIX — CBOE Volatility Index (market fear gauge)
-  # Replaces BAMLH0A0HYM2 which only starts May 2023
+               # Replaces BAMLH0A0HYM2 which only starts May 2023
 )
 
 # Depeg threshold: a stablecoin is considered "depegged"
@@ -346,7 +347,7 @@ fetch_yahoo <- function(ticker) {
   # Cl() and Vo() are quantmod helpers that extract the Close and
   # Volume columns regardless of how the columns are named.
   message("  Fetching Yahoo Finance data for: ", ticker)
-  
+
   tryCatch({
     xts_obj <- getSymbols(
       ticker,
@@ -355,7 +356,7 @@ fetch_yahoo <- function(ticker) {
       to          = END_DATE,
       auto.assign = FALSE
     )
-    
+
     df <- data.frame(
       date   = as.Date(index(xts_obj)),
       price  = as.numeric(Cl(xts_obj)),
@@ -363,11 +364,11 @@ fetch_yahoo <- function(ticker) {
       ticker = ticker,
       coin   = TICKER_LABELS[ticker]
     )
-    
+
     message("    Got ", nrow(df), " rows for ", ticker,
             " (", min(df$date), " to ", max(df$date), ")")
     return(df)
-    
+
   }, error = function(e) {
     warning("Failed to fetch ", ticker, ": ", e$message)
     return(NULL)
@@ -387,9 +388,9 @@ if (file.exists(yf_cache_path)) {
   cg_raw <- readRDS(yf_cache_path)
 } else {
   message("Pulling stablecoin data from Yahoo Finance...")
-  
+
   cg_raw <- purrr::map_dfr(TICKERS, fetch_yahoo)
-  
+
   saveRDS(cg_raw, yf_cache_path)
   message("Stablecoin data saved to cache.")
 }
@@ -423,7 +424,7 @@ print(table(cg_raw$coin))
 
 fetch_fred <- function(series_id) {
   message("  Fetching FRED series: ", series_id)
-  
+
   fredr(
     series_id         = series_id,
     observation_start = START_DATE,
@@ -444,13 +445,13 @@ if (file.exists(fred_cache_path)) {
   fred_raw <- readRDS(fred_cache_path)
 } else {
   message("Pulling FRED data from API...")
-  
+
   fred_list <- purrr::map(FRED_SERIES, fetch_fred)
-  
+
   # Join all three series on date using reduce + full_join
   # so no dates are dropped even if one series has gaps
   fred_raw <- purrr::reduce(fred_list, full_join, by = "date")
-  
+
   saveRDS(fred_raw, fred_cache_path)
   message("FRED data saved to cache.")
 }
@@ -617,14 +618,14 @@ message("  vix  : ", sum(is.na(fred_filled$vix)))
 cg_clean <- cg_clean |>
   mutate(
     coin   = factor(coin,   levels = c("USDC", "USDT", "DAI",
-                                       "FRAX", "UST")),
+                                        "FRAX", "UST")),
     ticker = factor(ticker),
     price  = as.numeric(price),
     volume = as.numeric(volume)
   )
 
 message("Coin factor levels: ", paste(levels(cg_clean$coin),
-                                      collapse = ", "))
+                                       collapse = ", "))
 
 
 # --- 2.5 Build the Master Dataframe -------------------------
@@ -645,7 +646,7 @@ master <- cg_clean |>
 message("Master dataframe: ", nrow(master), " rows x ",
         ncol(master), " columns")
 message("Coins in master : ", paste(levels(master$coin),
-                                    collapse = ", "))
+                                     collapse = ", "))
 message("Columns         : ", paste(names(master), collapse = ", "))
 
 
@@ -842,8 +843,8 @@ master <- master |>
                                    FUN = sd, fill = NA,
                                    align = "right", na.rm = TRUE),
     vol_spike     = as.integer(
-      volume > (roll_mean_vol + 2 * roll_sd_vol)
-    )
+                      volume > (roll_mean_vol + 2 * roll_sd_vol)
+                    )
   ) |>
   dplyr::select(-roll_mean_vol, -roll_sd_vol) |>
   ungroup()
@@ -1340,8 +1341,8 @@ usdc_pre <- master |>
   pull(peg_dev)
 
 t_test_result <- t.test(ust_pre, usdc_pre,
-                        alternative = "two.sided",
-                        var.equal   = FALSE)   # Welch's t-test
+                         alternative = "two.sided",
+                         var.equal   = FALSE)   # Welch's t-test
 
 message("--- Test 1: Two-Sample Welch T-Test (UST vs USDC pre-collapse) ---")
 print(t_test_result)
@@ -1438,8 +1439,8 @@ message("  (Wilcoxon test below, bootstrapping in Section 7).")
 message("--- Test 3: Levene's Test for Equality of Variance ---")
 
 levene_result <- car::leveneTest(peg_dev ~ coin,
-                                 data   = master,
-                                 center = median)
+                                  data   = master,
+                                  center = median)
 
 print(levene_result)
 
@@ -1500,8 +1501,8 @@ usdt_peg <- master |>
   pull(peg_dev)
 
 wilcox_result <- wilcox.test(ust_peg, usdt_peg,
-                             alternative = "greater",
-                             exact       = FALSE)
+                              alternative = "greater",
+                              exact       = FALSE)
 
 print(wilcox_result)
 
@@ -1684,8 +1685,8 @@ saveRDS(lm_full, "output/models/lm_full.rds")
 message("--- 6.3 Welch's ANOVA: Peg Deviation Across Coins ---")
 
 anova_result <- oneway.test(peg_dev ~ coin,
-                            data      = master,
-                            var.equal = FALSE)
+                             data      = master,
+                             var.equal = FALSE)
 
 print(anova_result)
 
@@ -2204,7 +2205,7 @@ pred_class <- ifelse(pred_full >= 0.5, "depeg", "stable")
 pred_class <- factor(pred_class, levels = c("stable", "depeg"))
 
 cm <- caret::confusionMatrix(pred_class, glm_data$depeg,
-                             positive = "depeg")
+                              positive = "depeg")
 print(cm)
 
 message("Interpretation:")
@@ -3024,13 +3025,13 @@ print(naniar::miss_var_summary(miss_data))
 
 # Visualize missingness
 p19 <- naniar::vis_miss(miss_data,
-                        warn_large_data = FALSE) +
+                         warn_large_data = FALSE) +
   labs(
     title    = "Missingness Pattern — Raw Stablecoin Data",
     subtitle = "Each column is a coin-variable pair | Black = missing"
   ) +
   theme(axis.text.x = element_text(angle = 45, hjust = 1,
-                                   size = 8))
+                                    size = 8))
 
 ggsave("output/plots/19_missingness_pattern.png", p19,
        width = 10, height = 6, dpi = 150)
@@ -3965,9 +3966,9 @@ message("Class imbalance ratio (neg/pos): ",
         round(neg_pos_ratio, 2))
 
 dtrain <- xgboost::xgb.DMatrix(data  = X_train,
-                               label = y_train)
+                                label = y_train)
 dtest  <- xgboost::xgb.DMatrix(data  = X_test,
-                               label = y_test)
+                                label = y_test)
 
 set.seed(42)
 xgb_model <- xgboost::xgb.train(
@@ -4039,7 +4040,7 @@ y_test_factor <- factor(
 )
 
 cm_xgb <- caret::confusionMatrix(pred_class_opt, y_test_factor,
-                                 positive = "depeg")
+                                  positive = "depeg")
 print(cm_xgb)
 
 message("Sensitivity (recall) at optimal threshold: ",
@@ -4266,7 +4267,7 @@ message("Date range: ", as.character(start(returns_xts)),
 # Summary stats via PerformanceAnalytics
 message("Return summary statistics:")
 pa_stats <- PerformanceAnalytics::table.Stats(returns_xts,
-                                              digits = 6)
+                                               digits = 6)
 print(pa_stats)
 
 
@@ -4381,7 +4382,7 @@ for (c in coins_list) {
     # Clip extreme returns for plotting only (UST collapse distorts scale)
     r <- returns_xts[, c]
     r_clipped <- r[r > quantile(r, 0.005, na.rm = TRUE) &
-                     r < quantile(r, 0.995, na.rm = TRUE)]
+                   r < quantile(r, 0.995, na.rm = TRUE)]
     PerformanceAnalytics::chart.Histogram(
       r_clipped,
       main     = paste(c, "Log Return Distribution (99% range)"),
