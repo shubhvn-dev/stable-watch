@@ -2684,3 +2684,249 @@ pca_result$rotation[, "PC2"] |>
 # approach and the two-model structure in Section 6.
 
 message("Section 10 complete. PCA done.")
+
+# ============================================================
+# SECTION 11 — TIME SERIES MODELING
+# (See Chapter 5: Time Series)
+# ============================================================
+#
+# Stablecoin peg deviation is a time series — observations are
+# ordered in time and exhibit serial dependence (today's value
+# is correlated with yesterday's). This section applies two
+# classic time series models:
+#
+#   1. ARIMA — models the level and autocorrelation structure
+#      of peg deviation as a linear function of its own past
+#      values and past errors. Provides a baseline forecast.
+#
+#   2. GARCH — models the volatility of log returns. GARCH
+#      captures volatility clustering — the empirical finding
+#      that large price moves tend to be followed by more large
+#      moves. This is exactly what we see in the data: UST's
+#      volatility built up in clusters before the collapse.
+#
+# We focus on USDT as a stable reference coin for ARIMA
+# (its peg deviation is stationary and well-behaved), and
+# UST for GARCH (its volatility clustering is the most
+# dramatic and analytically interesting).
+# ============================================================
+
+
+# --- 11.1 ARIMA: USDT Peg Deviation -------------------------
+#
+# ARIMA (AutoRegressive Integrated Moving Average) models a
+# time series as a function of its own lagged values (AR),
+# lagged forecast errors (MA), and differencing to achieve
+# stationarity (I). We use auto.arima() to select the optimal
+# (p, d, q) order automatically via AIC minimization.
+#
+# We use USDT because:
+#   - Its peg deviation is relatively stationary
+#   - It has the full 2020-2023 date range
+#   - It represents the "normal" stablecoin case
+#
+# (See Chapter 5: Time Series — ARIMA Models)
+
+message("--- 11.1 ARIMA: USDT Peg Deviation ---")
+
+usdt_ts <- master |>
+  dplyr::filter(coin == "USDT") |>
+  arrange(date) |>
+  pull(peg_dev)
+
+# Convert to time series object
+# Daily frequency — we use frequency = 7 to capture weekly
+# seasonality patterns in crypto markets
+usdt_ts_obj <- ts(usdt_ts, frequency = 7)
+
+message("Fitting ARIMA model on USDT peg deviation...")
+message("Using auto.arima() to select optimal (p, d, q) by AIC...")
+
+set.seed(42)
+arima_model <- forecast::auto.arima(
+  usdt_ts_obj,
+  seasonal     = TRUE,
+  stepwise     = FALSE,   # exhaustive search for best model
+  approximation = FALSE,
+  trace        = FALSE
+)
+
+message("ARIMA model selected:")
+print(arima_model)
+
+message("ARIMA model summary:")
+print(summary(arima_model))
+
+saveRDS(arima_model, "output/models/arima_usdt.rds")
+
+# OBSERVATION: The selected ARIMA order tells us about the
+# autocorrelation structure of USDT peg deviation. A low
+# AR order suggests peg deviation does not have long memory —
+# past values quickly lose influence on current values.
+# This is expected for a well-functioning stablecoin.
+
+
+# --- 11.2 ARIMA Forecast and Residual Diagnostics -----------
+#
+# We forecast 30 days ahead and examine the residuals.
+# Good residuals should be white noise — no autocorrelation
+# remaining, approximately normal distribution.
+# (See Chapter 5: Time Series — Forecasting and Diagnostics)
+
+message("--- 11.2 ARIMA Forecast (30 days ahead) ---")
+
+arima_forecast <- forecast::forecast(arima_model, h = 30)
+
+# Plot forecast
+arima_plot_data <- data.frame(
+  date  = seq(max(master$date[master$coin == "USDT"]) + 1,
+              by = "day", length.out = 30),
+  forecast = as.numeric(arima_forecast$mean),
+  lo_80    = as.numeric(arima_forecast$lower[, 1]),
+  hi_80    = as.numeric(arima_forecast$upper[, 1]),
+  lo_95    = as.numeric(arima_forecast$lower[, 2]),
+  hi_95    = as.numeric(arima_forecast$upper[, 2])
+)
+
+# Historical data for context
+usdt_hist <- master |>
+  dplyr::filter(coin == "USDT") |>
+  arrange(date) |>
+  tail(90) |>
+  dplyr::select(date, peg_dev)
+
+p17 <- ggplot() +
+  geom_line(data = usdt_hist,
+            aes(x = date, y = peg_dev),
+            color = "#16a34a", linewidth = 0.5) +
+  geom_ribbon(data = arima_plot_data,
+              aes(x = date, ymin = lo_95, ymax = hi_95),
+              fill = "#2563eb", alpha = 0.15) +
+  geom_ribbon(data = arima_plot_data,
+              aes(x = date, ymin = lo_80, ymax = hi_80),
+              fill = "#2563eb", alpha = 0.25) +
+  geom_line(data = arima_plot_data,
+            aes(x = date, y = forecast),
+            color = "#2563eb", linewidth = 0.7,
+            linetype = "dashed") +
+  geom_hline(yintercept = DEPEG_THRESHOLD,
+             linetype = "dotted", color = "gray40") +
+  labs(
+    title    = "ARIMA Forecast: USDT Peg Deviation (30 Days Ahead)",
+    subtitle = "Green = historical | Blue dashed = forecast | Shaded = 80% and 95% CI",
+    x        = NULL,
+    y        = "Peg Deviation"
+  ) +
+  theme_minimal(base_size = 11)
+
+ggsave("output/plots/17_arima_forecast_usdt.png", p17,
+       width = 10, height = 5, dpi = 150)
+print(p17)
+
+message("Plot 17 saved: ARIMA forecast.")
+
+# Residual diagnostics
+message("ARIMA Residual Diagnostics:")
+arima_resid <- residuals(arima_model)
+message("  Ljung-Box test (residual autocorrelation):")
+lb_test <- Box.test(arima_resid, lag = 20, type = "Ljung-Box")
+print(lb_test)
+if (lb_test$p.value > 0.05) {
+  message("  p > 0.05: Residuals show no significant autocorrelation.")
+  message("  ARIMA model has captured the serial dependence well.")
+} else {
+  message("  p < 0.05: Some residual autocorrelation remains.")
+  message("  Model may not fully capture the time series structure.")
+}
+
+
+# --- 11.3 GARCH: UST Log Return Volatility ------------------
+#
+# GARCH (Generalized AutoRegressive Conditional Heteroskedasticity)
+# models time-varying volatility. The core insight is that
+# financial return volatility is not constant — it clusters
+# in high-volatility regimes followed by calmer periods.
+#
+# We fit a GARCH(1,1) model to UST log returns. GARCH(1,1) is
+# the industry standard — the conditional variance at time t
+# depends on the previous period's squared return (ARCH term)
+# and the previous period's conditional variance (GARCH term).
+#
+# If the GARCH fit shows a volatility spike BEFORE May 9, 2022,
+# it provides model-based evidence that the collapse was
+# preceded by a detectable increase in volatility.
+# (See Chapter 5: Time Series — GARCH Models)
+
+message("--- 11.3 GARCH(1,1): UST Log Return Volatility ---")
+
+ust_returns <- master |>
+  dplyr::filter(coin == "UST", !is.na(log_return)) |>
+  arrange(date) |>
+  dplyr::select(date, log_return)
+
+# Specify GARCH(1,1) with normal distribution
+garch_spec <- rugarch::ugarchspec(
+  variance.model = list(
+    model     = "sGARCH",  # standard GARCH
+    garchOrder = c(1, 1)   # GARCH(1,1)
+  ),
+  mean.model = list(
+    armaOrder  = c(1, 0),  # AR(1) mean equation
+    include.mean = TRUE
+  ),
+  distribution.model = "norm"
+)
+
+message("Fitting GARCH(1,1) model on UST log returns...")
+
+garch_fit <- rugarch::ugarchfit(
+  spec = garch_spec,
+  data = ust_returns$log_return,
+  solver = "hybrid"
+)
+
+message("GARCH model summary:")
+print(garch_fit)
+
+saveRDS(garch_fit, "output/models/garch_ust.rds")
+
+# Extract conditional volatility (sigma)
+cond_vol <- data.frame(
+  date   = ust_returns$date,
+  sigma  = as.numeric(rugarch::sigma(garch_fit)),
+  return = ust_returns$log_return
+)
+
+# Plot conditional volatility over time
+p18 <- ggplot(cond_vol, aes(x = date, y = sigma)) +
+  geom_line(color = "#dc2626", linewidth = 0.5) +
+  geom_vline(xintercept = as.Date("2022-05-09"),
+             linetype = "dashed", color = "darkred",
+             linewidth = 0.6) +
+  annotate("text",
+           x     = as.Date("2022-05-09"),
+           y     = max(cond_vol$sigma) * 0.9,
+           label = "UST Collapse\nMay 9, 2022",
+           hjust = -0.1, size = 3, color = "darkred") +
+  labs(
+    title    = "GARCH(1,1) Conditional Volatility — UST Log Returns",
+    subtitle = "Estimated daily volatility (sigma) from GARCH model",
+    x        = NULL,
+    y        = "Conditional Volatility (sigma)"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(panel.grid.minor = element_blank())
+
+ggsave("output/plots/18_garch_conditional_volatility.png", p18,
+       width = 10, height = 5, dpi = 150)
+print(p18)
+
+message("Plot 18 saved: GARCH conditional volatility.")
+
+# OBSERVATION: If GARCH conditional volatility shows an upward
+# trend or spike in the days/weeks BEFORE May 9, 2022, it is
+# model-based evidence that the collapse was preceded by a
+# detectable volatility regime shift. This is the strongest
+# quantitative answer to our research question.
+
+message("Section 11 complete. Time series modeling done.")
