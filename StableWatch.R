@@ -2219,3 +2219,239 @@ message("  In a risk context, high sensitivity is critical —")
 message("  missing a depeg event is costlier than a false alarm.")
 
 message("Section 8 complete. GLM / Logistic Regression done.")
+
+# ============================================================
+# SECTION 9 — INTERMEDIATE GRAPHS
+# (See Chapter 4: Intermediate Graphs)
+# ============================================================
+#
+# Section 4 covered basic exploratory graphs. Here we produce
+# more analytically sophisticated visualizations that build
+# directly on the modeling results from Sections 5-8:
+#
+#   1. Correlation heatmap — relationships between all features
+#   2. Rolling volatility over time — shows stress buildup
+#   3. Peg deviation Z-score over time — normalized stress signal
+#   4. Volume spike overlay — volume spikes vs depeg events
+#   5. Feature distributions by depeg status — what separates
+#      depeg days from stable days?
+#
+# These graphs serve a dual purpose: they deepen our
+# understanding of the data and provide visual evidence
+# supporting the modeling choices made in Sections 6-8.
+# ============================================================
+
+
+# --- 9.1 Correlation Heatmap --------------------------------
+#
+# A correlation heatmap shows pairwise linear relationships
+# between all numeric features. This helps us identify:
+#   - Which features are strongly correlated with peg_dev
+#   - Which features are collinear with each other (potential
+#     multicollinearity issue for regression models)
+#   - Which macro variables move together
+#
+# (See Chapter 4: Intermediate Graphs — Correlation Plots)
+
+message("--- 9.1 Correlation Heatmap ---")
+
+# Select numeric features for correlation analysis
+# Exclude UST post-collapse to avoid distortion
+corr_data <- master |>
+  dplyr::filter(
+    !(coin == "UST" & date >= as.Date("2022-05-09")),
+    !is.na(vol_7d), !is.na(vol_30d), !is.na(peg_dev_z)
+  ) |>
+  dplyr::select(peg_dev, log_return, vol_7d, vol_30d,
+                peg_dev_z, dxy, sofr, vix) |>
+  na.omit()
+
+corr_matrix <- stats::cor(corr_data, method = "spearman")
+# Spearman correlation is appropriate given the non-normality
+# confirmed in Section 5 — it captures monotonic relationships
+# without assuming linearity or normality.
+
+p10 <- ggcorrplot::ggcorrplot(
+  corr_matrix,
+  method   = "circle",
+  type     = "lower",
+  lab      = TRUE,
+  lab_size = 3,
+  colors   = c("#dc2626", "white", "#2563eb"),
+  title    = "Spearman Correlation Matrix — All Features",
+  ggtheme  = theme_minimal(base_size = 11)
+)
+
+ggsave("output/plots/10_correlation_heatmap.png", p10,
+       width = 8, height = 7, dpi = 150)
+print(p10)
+
+message("Plot 10 saved: correlation heatmap.")
+
+# OBSERVATION: Strong correlations between vol_7d and vol_30d
+# are expected — they measure the same underlying volatility
+# at different windows. peg_dev_z should show a strong positive
+# correlation with peg_dev. Macro variables (dxy, sofr, vix)
+# correlating with peg_dev would confirm the regression findings
+# from Section 6.
+
+
+# --- 9.2 Rolling Volatility Over Time -----------------------
+#
+# Rolling volatility (vol_7d) is our key early-warning feature.
+# We plot it over time for all coins, with the stress events
+# annotated. The key question: does volatility spike BEFORE
+# the depeg event, or only at/after it?
+
+message("--- 9.2 Rolling Volatility Over Time ---")
+
+p11 <- master |>
+  dplyr::filter(!is.na(vol_7d)) |>
+  ggplot(aes(x = date, y = vol_7d, color = coin)) +
+  geom_line(linewidth = 0.4, alpha = 0.8) +
+  geom_vline(data = STRESS_EVENTS,
+             aes(xintercept = date),
+             linetype = "dotted", color = "red", linewidth = 0.5) +
+  facet_wrap(~ coin, scales = "free_y", ncol = 1) +
+  scale_x_date(date_breaks = "6 months", date_labels = "%b %Y") +
+  scale_color_manual(values = c(
+    "USDC" = "#2563eb", "USDT" = "#16a34a",
+    "DAI"  = "#d97706", "FRAX" = "#7c3aed", "UST" = "#dc2626"
+  )) +
+  labs(
+    title    = "7-Day Rolling Volatility of Log Returns",
+    subtitle = "Red dotted lines = stress events",
+    x        = NULL,
+    y        = "Rolling Volatility (SD of log returns, 7-day)"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    legend.position  = "none",
+    strip.text       = element_text(face = "bold"),
+    panel.grid.minor = element_blank()
+  )
+
+ggsave("output/plots/11_rolling_volatility.png", p11,
+       width = 10, height = 12, dpi = 150)
+print(p11)
+
+message("Plot 11 saved: rolling volatility.")
+
+# OBSERVATION: If UST's vol_7d spikes before May 9, 2022, it
+# confirms that volatility is a leading indicator of collapse —
+# directly supporting its use as a predictor in our models.
+# This is the visual answer to our research question.
+
+
+# --- 9.3 Peg Deviation Z-Score Over Time --------------------
+#
+# The Z-score normalizes peg deviation relative to each coin's
+# own recent history. A Z-score spike means the current
+# deviation is unusual for that coin — even if the absolute
+# value looks small. We plot it to show how the normalized
+# signal behaves around stress events.
+
+message("--- 9.3 Peg Deviation Z-Score Over Time ---")
+
+p12 <- master |>
+  dplyr::filter(!is.na(peg_dev_z),
+                peg_dev_z > -10, peg_dev_z < 10) |>
+  ggplot(aes(x = date, y = peg_dev_z, color = coin)) +
+  geom_line(linewidth = 0.3, alpha = 0.8) +
+  geom_hline(yintercept = 2, linetype = "dashed",
+             color = "gray30", linewidth = 0.4) +
+  geom_hline(yintercept = 0, linetype = "solid",
+             color = "gray60", linewidth = 0.2) +
+  geom_vline(data = STRESS_EVENTS,
+             aes(xintercept = date),
+             linetype = "dotted", color = "red", linewidth = 0.5) +
+  facet_wrap(~ coin, ncol = 1) +
+  scale_x_date(date_breaks = "6 months", date_labels = "%b %Y") +
+  scale_color_manual(values = c(
+    "USDC" = "#2563eb", "USDT" = "#16a34a",
+    "DAI"  = "#d97706", "FRAX" = "#7c3aed", "UST" = "#dc2626"
+  )) +
+  labs(
+    title    = "Peg Deviation Z-Score Over Time",
+    subtitle = "Dashed line = Z > 2 (stress threshold) | Red dotted = events",
+    x        = NULL,
+    y        = "Peg Deviation Z-Score (30-day rolling)"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    legend.position  = "none",
+    strip.text       = element_text(face = "bold"),
+    panel.grid.minor = element_blank()
+  )
+
+ggsave("output/plots/12_peg_dev_zscore.png", p12,
+       width = 10, height = 12, dpi = 150)
+print(p12)
+
+message("Plot 12 saved: peg deviation Z-score.")
+
+# OBSERVATION: Z-scores that spike above 2 before stress events
+# are the visual confirmation that our normalized signal fires
+# ahead of the collapse — answering the research question
+# directly in visual form.
+
+
+# --- 9.4 Feature Distributions: Depeg vs Stable Days --------
+#
+# We compare the distribution of key features on depeg days
+# vs stable days. This shows visually what the logistic
+# regression modeled numerically — the features that separate
+# the two classes.
+
+message("--- 9.4 Feature Distributions by Depeg Status ---")
+
+dist_data <- master |>
+  dplyr::filter(
+    !is.na(vol_7d), !is.na(peg_dev_z),
+    !(coin == "UST" & date >= as.Date("2022-05-09"))
+  ) |>
+  mutate(status = ifelse(depeg == 1, "Depeg Day", "Stable Day"))
+
+# Vol_7d by status
+p13a <- ggplot(dist_data,
+               aes(x = vol_7d, fill = status)) +
+  geom_density(alpha = 0.6) +
+  scale_x_continuous(limits = c(0, 0.05)) +
+  scale_fill_manual(values = c("Depeg Day" = "#dc2626",
+                               "Stable Day" = "#2563eb")) +
+  labs(title = "7-Day Rolling Volatility: Depeg vs Stable Days",
+       x = "vol_7d", y = "Density", fill = NULL) +
+  theme_minimal(base_size = 11) +
+  theme(legend.position = "bottom")
+
+# Peg_dev_z by status
+p13b <- ggplot(dist_data |>
+                 dplyr::filter(peg_dev_z > -5, peg_dev_z < 10),
+               aes(x = peg_dev_z, fill = status)) +
+  geom_density(alpha = 0.6) +
+  scale_fill_manual(values = c("Depeg Day" = "#dc2626",
+                               "Stable Day" = "#2563eb")) +
+  labs(title = "Peg Deviation Z-Score: Depeg vs Stable Days",
+       x = "peg_dev_z", y = "Density", fill = NULL) +
+  theme_minimal(base_size = 11) +
+  theme(legend.position = "bottom")
+
+p13 <- p13a + p13b +
+  plot_annotation(
+    title    = "Feature Distributions: Depeg Days vs Stable Days",
+    subtitle = "Both features show clear separation between classes"
+  )
+
+ggsave("output/plots/13_feature_distributions_by_depeg.png", p13,
+       width = 12, height = 5, dpi = 150)
+print(p13)
+
+message("Plot 13 saved: feature distributions by depeg status.")
+
+# OBSERVATION: Clear separation between depeg and stable day
+# distributions for both vol_7d and peg_dev_z visually confirms
+# these features have strong discriminative power — consistent
+# with their high coefficients in the logistic regression and
+# their expected dominance in the XGBoost model (Section 14).
+
+message("Section 9 complete. Intermediate graphs done.")
