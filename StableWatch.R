@@ -925,3 +925,361 @@ master |>
 saveRDS(master, master_path)
 message("Master dataframe with features saved to: ", master_path)
 message("Section 3 complete. Features ready for analysis.")
+
+# ============================================================
+# SECTION 4 — BASIC GRAPHS & DESCRIPTIVE STATISTICS
+# (See Chapter 1: Getting Started with Graphs;
+#  Chapter 3: Basic Statistics)
+# ============================================================
+#
+# Before modeling, we explore the data visually and statistically
+# to understand its structure, confirm our engineered features
+# behave as expected, and build the narrative that motivates
+# every modeling decision downstream.
+#
+# Key questions we answer in this section:
+#   - What do stablecoin prices look like over time?
+#   - When and how severely did UST depeg?
+#   - How does peg deviation distribute across coins?
+#   - What do the descriptive statistics tell us?
+#   - How does the UST structural missingness look visually?
+#
+# All plots are saved to output/plots/ and displayed inline.
+# ============================================================
+
+
+# --- 4.1 Price Time Series — All Five Coins -----------------
+#
+# Our first plot shows the raw daily closing price for all five
+# stablecoins over the full analysis window. A healthy stablecoin
+# should appear as a flat line at $1.00. Any deviation from that
+# baseline is immediately visible.
+#
+# Key things to look for:
+#   - UST's catastrophic collapse in May 2022
+#   - USDC's brief dip in March 2023 (SVB scare)
+#   - DAI and FRAX showing more baseline noise than USDC/USDT
+#
+# We use facet_wrap() to give each coin its own panel so the
+# collapse of UST doesn't compress the scale for stable coins.
+# (See Chapter 1: Getting Started with Graphs — Basic Plots)
+
+p1 <- ggplot(master, aes(x = date, y = price, color = coin)) +
+  geom_line(linewidth = 0.4, alpha = 0.9) +
+  geom_hline(yintercept = 1.00, linetype = "dashed",
+             color = "gray40", linewidth = 0.4) +
+  geom_vline(data = STRESS_EVENTS,
+             aes(xintercept = date),
+             linetype = "dotted", color = "red", linewidth = 0.5) +
+  facet_wrap(~ coin, scales = "free_y", ncol = 1) +
+  scale_x_date(date_breaks = "6 months", date_labels = "%b %Y") +
+  scale_color_manual(values = c(
+    "USDC" = "#2563eb", "USDT" = "#16a34a",
+    "DAI"  = "#d97706", "FRAX" = "#7c3aed", "UST" = "#dc2626"
+  )) +
+  labs(
+    title    = "Stablecoin Daily Closing Price (2020-2023)",
+    subtitle = "Dashed line = $1.00 peg | Red dotted lines = stress events",
+    x        = NULL,
+    y        = "Price (USD)",
+    color    = "Coin"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    legend.position  = "none",
+    strip.text       = element_text(face = "bold"),
+    panel.grid.minor = element_blank()
+  )
+
+ggsave("output/plots/01_price_timeseries.png", p1,
+       width = 10, height = 12, dpi = 150)
+print(p1)
+
+message("Plot 1 saved: price time series.")
+
+# OBSERVATION: UST's price collapses from ~$1.00 to near zero
+# between May 9-13, 2022 — a complete loss of peg in under a
+# week. USDC shows a brief dip below $0.99 on March 10, 2023
+# when Silicon Valley Bank (which held USDC reserves) collapsed.
+# DAI and FRAX show more baseline noise than USDC/USDT, reflecting
+# their more complex collateralization mechanisms.
+
+
+# --- 4.2 UST Structural Missingness Visualization -----------
+#
+# As documented in Section 2, UST has 448 consecutive NAs
+# starting 2022-10-10 — Yahoo Finance stops reporting after
+# the coin was effectively delisted. This is not random
+# missingness but structural: the market ceased to exist.
+#
+# We visualize the full UST price series including the gap
+# to make this explicit for the reader. The gap itself is
+# informative — it marks the point at which the market
+# gave up entirely on the coin.
+# (See Chapter 5: Advanced Methods for Missing Data)
+
+ust_full <- cg_raw |>
+  dplyr::filter(coin == "UST") |>
+  mutate(date = as.Date(date))
+
+p2 <- ggplot(ust_full, aes(x = date, y = price)) +
+  geom_line(color = "#dc2626", linewidth = 0.5, na.rm = TRUE) +
+  geom_point(data = dplyr::filter(ust_full, is.na(price)),
+             aes(y = 0), shape = 4, color = "gray50", size = 0.3) +
+  geom_vline(xintercept = as.Date("2022-05-09"),
+             linetype = "dashed", color = "darkred") +
+  geom_vline(xintercept = as.Date("2022-10-09"),
+             linetype = "dotted", color = "gray40") +
+  annotate("text", x = as.Date("2022-05-09"), y = 0.8,
+           label = "Collapse begins\nMay 9, 2022",
+           hjust = -0.1, size = 3, color = "darkred") +
+  annotate("text", x = as.Date("2022-10-09"), y = 0.5,
+           label = "Last valid\nobservation",
+           hjust = -0.1, size = 3, color = "gray40") +
+  scale_x_date(date_breaks = "3 months", date_labels = "%b %Y") +
+  labs(
+    title    = "UST Price Series — Full History Including Delisting Gap",
+    subtitle = "448 consecutive NAs after 2022-10-09 reflect structural missingness (delisting)",
+    x        = NULL,
+    y        = "Price (USD)"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(panel.grid.minor = element_blank())
+
+ggsave("output/plots/02_ust_missingness.png", p2,
+       width = 10, height = 5, dpi = 150)
+print(p2)
+
+message("Plot 2 saved: UST missingness visualization.")
+
+# OBSERVATION: The gap after 2022-10-09 is not a data error —
+# it represents the complete absence of a functioning market.
+# By this point UST was trading at ~$0.03, a 97% loss from peg.
+# We treat these NAs as censored observations, not missing data
+# to be imputed. This distinction matters for our models.
+
+
+# --- 4.3 Peg Deviation Over Time ----------------------------
+#
+# Rather than raw price, peg deviation (|price - 1.00|) is our
+# core analytical variable. Plotting it over time for all coins
+# makes the stress periods immediately visible as spikes.
+#
+# We use a log scale on the y-axis because peg deviations span
+# several orders of magnitude — from 0.0001 for stable periods
+# to 0.99 for UST at collapse. A linear scale would make the
+# stable coins invisible.
+
+p3 <- master |>
+  dplyr::filter(peg_dev > 0) |>
+  ggplot(aes(x = date, y = peg_dev, color = coin)) +
+  geom_line(linewidth = 0.3, alpha = 0.8) +
+  geom_hline(yintercept = DEPEG_THRESHOLD,
+             linetype = "dashed", color = "gray30", linewidth = 0.4) +
+  geom_vline(data = STRESS_EVENTS,
+             aes(xintercept = date),
+             linetype = "dotted", color = "red", linewidth = 0.5) +
+  facet_wrap(~ coin, ncol = 1) +
+  scale_y_log10(labels = scales::percent_format(accuracy = 0.01)) +
+  scale_x_date(date_breaks = "6 months", date_labels = "%b %Y") +
+  scale_color_manual(values = c(
+    "USDC" = "#2563eb", "USDT" = "#16a34a",
+    "DAI"  = "#d97706", "FRAX" = "#7c3aed", "UST" = "#dc2626"
+  )) +
+  labs(
+    title    = "Peg Deviation Over Time (Log Scale)",
+    subtitle = "Dashed line = 0.5% depeg threshold | Red dotted = stress events",
+    x        = NULL,
+    y        = "Peg Deviation |price - $1.00| (log scale)",
+    color    = "Coin"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    legend.position  = "none",
+    strip.text       = element_text(face = "bold"),
+    panel.grid.minor = element_blank()
+  )
+
+ggsave("output/plots/03_peg_deviation_timeseries.png", p3,
+       width = 10, height = 12, dpi = 150)
+print(p3)
+
+message("Plot 3 saved: peg deviation time series.")
+
+# OBSERVATION: On the log scale, the contrast is striking.
+# USDC and USDT maintain peg deviation below 0.5% for most
+# of the period. UST's deviation spikes from baseline to 99%
+# in a matter of days in May 2022. DAI and FRAX show more
+# frequent exceedances of the 0.5% threshold, consistent with
+# their elevated depeg rates (16.5% and 18% respectively)
+# that we observed in Section 3.
+
+
+# --- 4.4 Descriptive Statistics -----------------------------
+#
+# We compute a comprehensive descriptive statistics table for
+# peg deviation — the core variable — broken down by coin.
+# This satisfies the rubric requirement for basic statistics
+# and gives us a quantitative foundation for all tests that
+# follow in Section 5.
+# (See Chapter 3: Basic Statistics — Descriptive Statistics)
+
+desc_stats <- master |>
+  group_by(coin) |>
+  summarise(
+    n          = n(),
+    mean       = round(mean(peg_dev, na.rm = TRUE), 6),
+    median     = round(median(peg_dev, na.rm = TRUE), 6),
+    sd         = round(sd(peg_dev, na.rm = TRUE), 6),
+    min        = round(min(peg_dev, na.rm = TRUE), 6),
+    max        = round(max(peg_dev, na.rm = TRUE), 6),
+    skewness   = round(moments::skewness(peg_dev, na.rm = TRUE), 3),
+    kurtosis   = round(moments::kurtosis(peg_dev, na.rm = TRUE), 3),
+    depeg_rate = round(mean(depeg, na.rm = TRUE) * 100, 2)
+  )
+
+message("--- Descriptive Statistics: Peg Deviation by Coin ---")
+print(desc_stats)
+
+# Save as CSV for report
+write.csv(desc_stats, "output/tables/descriptive_stats.csv",
+          row.names = FALSE)
+
+# OBSERVATION: The skewness and kurtosis values are revealing.
+# All coins show strong positive skewness — most days are near
+# the peg, but extreme deviations pull the mean up significantly.
+# UST's kurtosis is extreme, reflecting the fat-tailed nature
+# of its collapse. This non-normality motivates our use of
+# non-parametric tests and bootstrapping in Sections 5 and 7.
+
+
+# --- 4.5 Peg Deviation Distribution — Histograms ------------
+#
+# Histograms of peg deviation show the shape of each coin's
+# distribution. We expect right-skewed distributions for all
+# coins — most days cluster near zero with occasional large
+# deviations. UST's distribution will look fundamentally
+# different due to the collapse.
+# (See Chapter 1: Basic Graphs — Histograms)
+
+p4 <- master |>
+  dplyr::filter(peg_dev < 0.1) |>   # exclude UST collapse for scale
+  ggplot(aes(x = peg_dev, fill = coin)) +
+  geom_histogram(bins = 50, alpha = 0.8, color = "white",
+                 linewidth = 0.2) +
+  geom_vline(xintercept = DEPEG_THRESHOLD,
+             linetype = "dashed", color = "gray30") +
+  facet_wrap(~ coin, scales = "free_y", ncol = 1) +
+  scale_x_continuous(labels = scales::percent_format(accuracy = 0.1)) +
+  scale_fill_manual(values = c(
+    "USDC" = "#2563eb", "USDT" = "#16a34a",
+    "DAI"  = "#d97706", "FRAX" = "#7c3aed", "UST" = "#dc2626"
+  )) +
+  labs(
+    title    = "Distribution of Peg Deviation by Coin",
+    subtitle = "Capped at 10% for scale | Dashed line = 0.5% depeg threshold",
+    x        = "Peg Deviation |price - $1.00|",
+    y        = "Count"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    legend.position  = "none",
+    strip.text       = element_text(face = "bold"),
+    panel.grid.minor = element_blank()
+  )
+
+ggsave("output/plots/04_peg_deviation_histograms.png", p4,
+       width = 8, height = 12, dpi = 150)
+print(p4)
+
+message("Plot 4 saved: peg deviation histograms.")
+
+
+# --- 4.6 Boxplots — Peg Deviation by Coin -------------------
+#
+# Boxplots give us a compact view of the central tendency,
+# spread, and outliers for each coin's peg deviation. We use
+# a log scale to make the differences between coins visible
+# without UST dominating the plot.
+# (See Chapter 4: Intermediate Graphs — Boxplots)
+
+p5 <- master |>
+  dplyr::filter(peg_dev > 0) |>
+  ggplot(aes(x = coin, y = peg_dev, fill = coin)) +
+  geom_boxplot(alpha = 0.7, outlier.size = 0.5,
+               outlier.alpha = 0.3) +
+  geom_hline(yintercept = DEPEG_THRESHOLD,
+             linetype = "dashed", color = "gray30") +
+  scale_y_log10(labels = scales::percent_format(accuracy = 0.01)) +
+  scale_fill_manual(values = c(
+    "USDC" = "#2563eb", "USDT" = "#16a34a",
+    "DAI"  = "#d97706", "FRAX" = "#7c3aed", "UST" = "#dc2626"
+  )) +
+  labs(
+    title    = "Peg Deviation Distribution by Coin (Log Scale)",
+    subtitle = "Dashed line = 0.5% depeg threshold",
+    x        = NULL,
+    y        = "Peg Deviation (log scale)"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(legend.position = "none")
+
+ggsave("output/plots/05_peg_deviation_boxplots.png", p5,
+       width = 8, height = 5, dpi = 150)
+print(p5)
+
+message("Plot 5 saved: peg deviation boxplots.")
+
+# OBSERVATION: The boxplots confirm what the descriptive stats
+# showed — UST has a dramatically higher median and spread than
+# the other coins. USDC and USDT have the tightest distributions,
+# clustering well below the 0.5% threshold. DAI and FRAX sit
+# in between, with more frequent exceedances.
+
+
+# --- 4.7 Volume Over Time -----------------------------------
+#
+# Trading volume is a key early warning signal — unusual volume
+# often precedes or accompanies depeg events. We plot daily
+# volume for each coin, highlighting the stress event dates.
+
+p6 <- master |>
+  mutate(volume_bn = volume / 1e9) |>
+  ggplot(aes(x = date, y = volume_bn, color = coin)) +
+  geom_line(linewidth = 0.3, alpha = 0.7) +
+  geom_vline(data = STRESS_EVENTS,
+             aes(xintercept = date),
+             linetype = "dotted", color = "red", linewidth = 0.5) +
+  facet_wrap(~ coin, scales = "free_y", ncol = 1) +
+  scale_x_date(date_breaks = "6 months", date_labels = "%b %Y") +
+  scale_color_manual(values = c(
+    "USDC" = "#2563eb", "USDT" = "#16a34a",
+    "DAI"  = "#d97706", "FRAX" = "#7c3aed", "UST" = "#dc2626"
+  )) +
+  labs(
+    title    = "Daily Trading Volume by Coin (2020-2023)",
+    subtitle = "Red dotted lines = stress events",
+    x        = NULL,
+    y        = "Volume (Billions USD)"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    legend.position  = "none",
+    strip.text       = element_text(face = "bold"),
+    panel.grid.minor = element_blank()
+  )
+
+ggsave("output/plots/06_volume_timeseries.png", p6,
+       width = 10, height = 12, dpi = 150)
+print(p6)
+
+message("Plot 6 saved: volume time series.")
+
+# OBSERVATION: UST shows a dramatic volume spike in May 2022
+# coinciding exactly with the collapse — a clear signal that
+# volume-based features will be informative predictors.
+# USDC shows elevated volume around the March 2023 SVB event.
+# This visual evidence motivates our vol_spike feature and
+# supports its inclusion in the classification model.
+
+message("Section 4 complete. EDA and basic graphs done.")
