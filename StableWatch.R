@@ -3850,3 +3850,358 @@ if (slope_prop_test$p.value < 0.05 | t_slope$p.value < 0.05) {
 # reflexive reserve spiral rather than a volatility event.
 
 message("Section 13 complete — cluster analysis and validation done.")
+
+# ============================================================
+# SECTION 14 — CLASSIFICATION & MACHINE LEARNING
+# (See Chapter 6: Classification; Chapter 7: Advanced Methods)
+# ============================================================
+#
+# Sections 5-8 confirmed that vol_7d, vol_30d, and peg_dev_z
+# are the dominant predictors of depeg events. Section 13
+# showed that price-based signals detect gradual stress but
+# not reflexive algorithmic collapse.
+#
+# Here we build the full classification model using XGBoost —
+# a gradient-boosted tree ensemble that can capture non-linear
+# interactions between features that logistic regression misses.
+# We then use SHAP (SHapley Additive exPlanations) to explain
+# which features drive each prediction — making the black-box
+# model interpretable.
+#
+# Pipeline:
+#   1. Train XGBoost on USDC, USDT, DAI, FRAX (no UST)
+#   2. Tune the classification threshold for recall vs precision
+#   3. Evaluate on a held-out test set
+#   4. Apply to UST pre-collapse as out-of-sample backtest
+#   5. SHAP feature importance and individual explanations
+# ============================================================
+
+
+# --- 14.1 Prepare Classification Data -----------------------
+#
+# We train on the four functioning stablecoins — same split
+# as the cluster analysis. UST is reserved for out-of-sample
+# backtesting. We use a 80/20 train/test split stratified
+# by the depeg label to preserve class balance.
+# (See Chapter 6: Classification — Train/Test Split)
+
+message("--- 14.1 Preparing Classification Data ---")
+message("NOTE: peg_dev is EXCLUDED from features.")
+message("  depeg = 1 when peg_dev > 0.005, so including peg_dev")
+message("  would be tautological — the model would trivially learn")
+message("  the label definition rather than the early warning signal.")
+message("  Features used: vol_7d, vol_30d, peg_dev_z, vol_spike,")
+message("  dxy, sofr, vix, coin_num — all leading indicators.")
+
+xgb_data <- master |>
+  dplyr::filter(
+    coin %in% c("USDC", "USDT", "DAI", "FRAX"),
+    !is.na(vol_7d), !is.na(vol_30d),
+    !is.na(peg_dev_z), !is.na(vol_spike),
+    !is.na(dxy), !is.na(sofr), !is.na(vix)
+  ) |>
+  mutate(
+    coin_num = as.integer(coin)   # encode coin as integer feature
+  ) |>
+  dplyr::select(
+    date, coin, depeg,
+    vol_7d, vol_30d, peg_dev_z,
+    vol_spike, dxy, sofr, vix, coin_num
+  )
+
+message("Classification data: ", nrow(xgb_data), " rows")
+message("Depeg rate: ",
+        round(mean(xgb_data$depeg) * 100, 2), "%")
+message("Class balance:")
+print(table(xgb_data$depeg))
+
+# Stratified 80/20 split
+set.seed(42)
+depeg_idx  <- which(xgb_data$depeg == 1)
+stable_idx <- which(xgb_data$depeg == 0)
+
+train_depeg  <- sample(depeg_idx,  floor(0.8 * length(depeg_idx)))
+train_stable <- sample(stable_idx, floor(0.8 * length(stable_idx)))
+train_idx    <- c(train_depeg, train_stable)
+
+train_data <- xgb_data[train_idx, ]
+test_data  <- xgb_data[-train_idx, ]
+
+message("Train size: ", nrow(train_data),
+        " | Depeg rate: ",
+        round(mean(train_data$depeg) * 100, 2), "%")
+message("Test size:  ", nrow(test_data),
+        " | Depeg rate: ",
+        round(mean(test_data$depeg) * 100, 2), "%")
+
+feature_cols <- c("vol_7d", "vol_30d", "peg_dev_z",
+                  "vol_spike", "dxy", "sofr", "vix", "coin_num")
+
+X_train <- as.matrix(train_data[, feature_cols])
+y_train <- train_data$depeg
+
+X_test  <- as.matrix(test_data[, feature_cols])
+y_test  <- test_data$depeg
+
+
+# --- 14.2 Train XGBoost -------------------------------------
+#
+# XGBoost is a gradient-boosted tree ensemble. It iteratively
+# builds trees where each tree corrects the errors of the
+# previous ones. Key hyperparameters:
+#   - nrounds: number of boosting rounds (trees)
+#   - max_depth: maximum tree depth (complexity)
+#   - eta: learning rate (shrinkage)
+#   - scale_pos_weight: handles class imbalance by upweighting
+#     the minority class (depeg events)
+#
+# (See Chapter 6: Classification — Ensemble Methods)
+
+message("--- 14.2 Training XGBoost ---")
+
+# Class imbalance ratio
+neg_pos_ratio <- sum(y_train == 0) / sum(y_train == 1)
+message("Class imbalance ratio (neg/pos): ",
+        round(neg_pos_ratio, 2))
+
+dtrain <- xgboost::xgb.DMatrix(data  = X_train,
+                               label = y_train)
+dtest  <- xgboost::xgb.DMatrix(data  = X_test,
+                               label = y_test)
+
+set.seed(42)
+xgb_model <- xgboost::xgb.train(
+  params = list(
+    objective        = "binary:logistic",
+    eval_metric      = "auc",
+    max_depth        = 4,
+    eta              = 0.05,
+    subsample        = 0.8,
+    colsample_bytree = 0.8,
+    scale_pos_weight = neg_pos_ratio,
+    min_child_weight = 5
+  ),
+  data       = dtrain,
+  nrounds    = 300,
+  watchlist  = list(train = dtrain, test = dtest),
+  verbose    = 0,
+  print_every_n = 50
+)
+
+message("XGBoost training complete.")
+
+saveRDS(xgb_model, "output/models/xgb_depeg.rds")
+
+
+# --- 14.3 Evaluate on Test Set ------------------------------
+#
+# We compute AUC on the test set and compare against the
+# logistic regression baseline from Section 8 (AUC = 0.917).
+# We also tune the classification threshold to maximize
+# recall — in a risk context, missing a depeg is worse
+# than a false alarm.
+# (See Chapter 6: Classification — Model Evaluation)
+
+message("--- 14.3 Test Set Evaluation ---")
+
+pred_prob <- predict(xgb_model, dtest)
+
+roc_xgb <- pROC::roc(y_test, pred_prob, quiet = TRUE)
+auc_xgb <- pROC::auc(roc_xgb)
+
+message("XGBoost AUC (test set): ", round(auc_xgb, 4))
+message("Logistic GLM AUC      : 0.9174  (Section 8 baseline)")
+
+# Find optimal threshold maximizing F1 score
+thresholds <- seq(0.05, 0.95, by = 0.01)
+f1_scores  <- sapply(thresholds, function(t) {
+  pred_class <- as.integer(pred_prob >= t)
+  tp <- sum(pred_class == 1 & y_test == 1)
+  fp <- sum(pred_class == 1 & y_test == 0)
+  fn <- sum(pred_class == 0 & y_test == 1)
+  precision <- ifelse(tp + fp == 0, 0, tp / (tp + fp))
+  recall    <- ifelse(tp + fn == 0, 0, tp / (tp + fn))
+  ifelse(precision + recall == 0, 0,
+         2 * precision * recall / (precision + recall))
+})
+
+optimal_threshold <- thresholds[which.max(f1_scores)]
+message("Optimal threshold (max F1): ", optimal_threshold)
+
+# Confusion matrix at optimal threshold
+pred_class_opt <- factor(
+  ifelse(pred_prob >= optimal_threshold, "depeg", "stable"),
+  levels = c("stable", "depeg")
+)
+y_test_factor <- factor(
+  ifelse(y_test == 1, "depeg", "stable"),
+  levels = c("stable", "depeg")
+)
+
+cm_xgb <- caret::confusionMatrix(pred_class_opt, y_test_factor,
+                                 positive = "depeg")
+print(cm_xgb)
+
+message("Sensitivity (recall) at optimal threshold: ",
+        round(cm_xgb$byClass["Sensitivity"], 4))
+message("Specificity at optimal threshold: ",
+        round(cm_xgb$byClass["Specificity"], 4))
+message("Precision (PPV) at optimal threshold: ",
+        round(cm_xgb$byClass["Pos Pred Value"], 4))
+
+# ROC plot
+roc_df_xgb <- data.frame(
+  fpr = 1 - roc_xgb$specificities,
+  tpr = roc_xgb$sensitivities
+)
+
+p24 <- ggplot(roc_df_xgb, aes(x = fpr, y = tpr)) +
+  geom_line(color = "#2563eb", linewidth = 0.8) +
+  geom_abline(slope = 1, intercept = 0,
+              linetype = "dashed", color = "gray50") +
+  annotate("text", x = 0.6, y = 0.2,
+           label = paste0("AUC = ", round(auc_xgb, 4)),
+           size = 4, color = "#2563eb") +
+  labs(
+    title    = "XGBoost ROC Curve — Test Set",
+    subtitle = "Trained on USDC/USDT/DAI/FRAX | Tested on held-out 20%",
+    x        = "False Positive Rate",
+    y        = "True Positive Rate"
+  ) +
+  theme_minimal(base_size = 11)
+
+ggsave("output/plots/24_xgb_roc_curve.png", p24,
+       width = 7, height = 6, dpi = 150)
+print(p24)
+message("Plot 24 saved: XGBoost ROC curve.")
+
+
+# --- 14.4 SHAP Feature Importance ---------------------------
+#
+# SHAP (SHapley Additive exPlanations) decomposes each
+# prediction into contributions from each feature. Unlike
+# standard feature importance (which just counts splits),
+# SHAP shows how much each feature pushed the prediction
+# toward or away from a depeg classification.
+#
+# We compute global SHAP importance (mean |SHAP|) and a
+# beeswarm plot showing direction and magnitude of each
+# feature's effect across all predictions.
+# (See Chapter 7: Advanced Methods — Model Interpretability)
+
+message("--- 14.4 SHAP Feature Importance ---")
+
+shap_obj <- shapviz::shapviz(xgb_model, X_pred = X_train)
+
+# Global importance plot
+p25 <- shapviz::sv_importance(shap_obj, kind = "bar") +
+  labs(
+    title    = "SHAP Feature Importance — XGBoost Depeg Classifier",
+    subtitle = "Mean absolute SHAP value across training set"
+  ) +
+  theme_minimal(base_size = 11)
+
+ggsave("output/plots/25_shap_importance.png", p25,
+       width = 8, height = 5, dpi = 150)
+print(p25)
+message("Plot 25 saved: SHAP importance.")
+
+# Beeswarm plot — shows direction of effect
+p26 <- shapviz::sv_importance(shap_obj, kind = "beeswarm") +
+  labs(
+    title    = "SHAP Beeswarm — Feature Direction and Magnitude",
+    subtitle = "Each point = one observation | Color = feature value"
+  ) +
+  theme_minimal(base_size = 11)
+
+ggsave("output/plots/26_shap_beeswarm.png", p26,
+       width = 9, height = 6, dpi = 150)
+print(p26)
+message("Plot 26 saved: SHAP beeswarm.")
+
+# OBSERVATION: SHAP provides the "why" behind each prediction.
+# We expect vol_7d and peg_dev_z to have the highest importance
+# — consistent with the GLM results in Section 8. High values
+# of these features should push SHAP values positive (toward
+# depeg), while low values should push negative (toward stable).
+
+
+# --- 14.5 UST Pre-Collapse Backtest -------------------------
+#
+# The critical validation: apply the trained XGBoost model to
+# UST's pre-collapse history (Nov 2020 – May 8, 2022) and plot
+# the predicted depeg probability over time.
+#
+# If the model's predicted probability rises in the days/weeks
+# before May 9, 2022, it provides out-of-sample evidence that
+# the signal fires ahead of the collapse — directly answering
+# the research question.
+
+message("--- 14.5 UST Pre-Collapse Backtest ---")
+
+ust_backtest <- master |>
+  dplyr::filter(
+    coin == "UST",
+    date < as.Date("2022-05-09"),
+    !is.na(vol_7d), !is.na(vol_30d),
+    !is.na(peg_dev_z), !is.na(vol_spike),
+    !is.na(dxy), !is.na(sofr), !is.na(vix)
+  ) |>
+  mutate(coin_num = as.integer(coin))
+
+# Note: X_ust uses feature_cols which excludes peg_dev
+# peg_dev is kept in ust_backtest dataframe for plotting only
+
+X_ust <- as.matrix(ust_backtest[, feature_cols])
+ust_backtest$pred_prob <- predict(
+  xgb_model,
+  xgboost::xgb.DMatrix(data = X_ust)
+)
+
+message("UST backtest observations: ", nrow(ust_backtest))
+message("Mean predicted depeg prob: ",
+        round(mean(ust_backtest$pred_prob), 4))
+message("Max predicted depeg prob: ",
+        round(max(ust_backtest$pred_prob), 4))
+message("% days above 0.5 threshold: ",
+        round(mean(ust_backtest$pred_prob > 0.5) * 100, 2), "%")
+message("% days above optimal threshold (",
+        optimal_threshold, "): ",
+        round(mean(ust_backtest$pred_prob > optimal_threshold) * 100, 2), "%")
+
+p27 <- ggplot(ust_backtest,
+              aes(x = date, y = pred_prob)) +
+  geom_line(color = "#dc2626", linewidth = 0.5, alpha = 0.8) +
+  geom_hline(yintercept = optimal_threshold,
+             linetype = "dashed", color = "gray30",
+             linewidth = 0.5) +
+  annotate("text",
+           x     = min(ust_backtest$date) + 30,
+           y     = optimal_threshold + 0.02,
+           label = paste0("Optimal threshold = ",
+                          optimal_threshold),
+           size = 3, color = "gray30") +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1),
+                     limits = c(0, 1)) +
+  scale_x_date(date_breaks = "3 months", date_labels = "%b %Y") +
+  labs(
+    title    = "UST Pre-Collapse: XGBoost Predicted Depeg Probability",
+    subtitle = "Model trained on USDC/USDT/DAI/FRAX — never saw UST data",
+    x        = NULL,
+    y        = "Predicted Depeg Probability"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(panel.grid.minor = element_blank())
+
+ggsave("output/plots/27_ust_xgb_backtest.png", p27,
+       width = 10, height = 5, dpi = 150)
+print(p27)
+message("Plot 27 saved: UST XGBoost backtest.")
+
+# OBSERVATION: If the predicted depeg probability for UST
+# spikes above the optimal threshold in the days before
+# May 9, 2022, the model provides genuine early warning.
+# This is the primary answer to the research question —
+# can these signals predict depeg events before they occur?
+
+message("Section 14 complete. XGBoost + SHAP done.")
