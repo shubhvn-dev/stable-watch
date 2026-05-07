@@ -1744,3 +1744,253 @@ message("  distinguishable in terms of peg risk.")
 # elevated depeg rates observed in Sections 3 and 4.
 
 message("Section 6 complete. Regression and ANOVA done.")
+
+# ============================================================
+# SECTION 7 — RESAMPLING & BOOTSTRAPPING
+# (See Chapter 4: Resampling Statistics and Bootstrapping)
+# ============================================================
+#
+# Classical confidence intervals assume normality. We confirmed
+# in Section 5 that peg deviation is highly non-normal across
+# all coins. Bootstrapping gives us distribution-free confidence
+# intervals by repeatedly resampling our data and computing
+# the statistic of interest each time.
+#
+# We bootstrap three quantities that are central to our analysis:
+#
+#   1. Mean peg deviation per coin — gives us robust CIs
+#      around our key descriptive statistic without assuming
+#      normality
+#
+#   2. The difference in mean peg deviation between UST and
+#      USDC pre-collapse — tests whether the gap we found
+#      in Section 5 is robust
+#
+#   3. Depeg rate per coin — what is the true range of the
+#      probability of a depeg event for each coin?
+#
+# We use the boot package with 2000 resamples — enough for
+# stable CI estimates without excessive runtime.
+# ============================================================
+
+
+# --- 7.1 Bootstrap: Mean Peg Deviation Per Coin -------------
+#
+# We bootstrap the mean peg deviation for each coin separately.
+# The bootstrap CI shows the range of plausible values for the
+# true mean, accounting for the heavy-tailed, non-normal
+# distribution of peg deviations.
+#
+# (See Chapter 4: Resampling Statistics and Bootstrapping)
+
+message("--- 7.1 Bootstrap: Mean Peg Deviation Per Coin ---")
+
+set.seed(42)
+B <- 2000   # number of bootstrap resamples
+
+# Bootstrap function: returns the mean of a resample
+boot_mean <- function(data, indices) {
+  mean(data[indices], na.rm = TRUE)
+}
+
+# Run bootstrap for each coin and collect results
+boot_results <- master |>
+  group_by(coin) |>
+  summarise(
+    observed_mean = mean(peg_dev, na.rm = TRUE),
+    boot_obj      = list(
+      boot::boot(
+        data    = peg_dev[!is.na(peg_dev)],
+        statistic = boot_mean,
+        R       = B
+      )
+    )
+  ) |>
+  mutate(
+    ci_lower = sapply(boot_obj, function(b) {
+      boot::boot.ci(b, type = "perc", conf = 0.95)$percent[4]
+    }),
+    ci_upper = sapply(boot_obj, function(b) {
+      boot::boot.ci(b, type = "perc", conf = 0.95)$percent[5]
+    })
+  ) |>
+  dplyr::select(-boot_obj)
+
+message("Bootstrap 95% CIs for mean peg deviation (2000 resamples):")
+print(boot_results)
+
+# OBSERVATION: Bootstrap CIs that do not overlap between two
+# coins provide strong evidence of a real difference in mean
+# peg deviation — more reliable than classical CIs given the
+# non-normality confirmed in Section 5.
+
+
+# --- 7.2 Bootstrap CI Plot ----------------------------------
+#
+# We visualize the bootstrap confidence intervals as a dot plot
+# with error bars, making the uncertainty and differences
+# between coins immediately apparent.
+
+p7 <- ggplot(boot_results,
+             aes(x = coin, y = observed_mean,
+                 ymin = ci_lower, ymax = ci_upper,
+                 color = coin)) +
+  geom_pointrange(size = 0.8, linewidth = 1) +
+  geom_hline(yintercept = DEPEG_THRESHOLD,
+             linetype = "dashed", color = "gray40") +
+  scale_color_manual(values = c(
+    "USDC" = "#2563eb", "USDT" = "#16a34a",
+    "DAI"  = "#d97706", "FRAX" = "#7c3aed", "UST" = "#dc2626"
+  )) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 0.1)) +
+  labs(
+    title    = "Bootstrap 95% Confidence Intervals: Mean Peg Deviation",
+    subtitle = paste0("2000 resamples | Percentile method | ",
+                      "Dashed = 0.5% depeg threshold"),
+    x        = NULL,
+    y        = "Mean Peg Deviation"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(legend.position = "none")
+
+ggsave("output/plots/07_bootstrap_ci_mean_peg_dev.png", p7,
+       width = 8, height = 5, dpi = 150)
+print(p7)
+
+message("Plot 7 saved: bootstrap CI for mean peg deviation.")
+
+
+# --- 7.3 Bootstrap: Pre-Collapse UST vs USDC Difference -----
+#
+# In Section 5, the t-test found UST's mean peg deviation was
+# significantly higher than USDC's pre-collapse (p = 0.0048).
+# Here we bootstrap the difference in means to get a robust
+# CI for that gap without assuming normality.
+#
+# If the 95% CI for (mean_UST - mean_USDC) excludes zero,
+# we confirm the pre-collapse difference is real.
+
+message("--- 7.2 Bootstrap: Pre-Collapse UST vs USDC Difference ---")
+
+set.seed(42)
+
+ust_pre_vec  <- master |>
+  dplyr::filter(coin == "UST",  date < pre_collapse) |>
+  pull(peg_dev) |>
+  na.omit()
+
+usdc_pre_vec <- master |>
+  dplyr::filter(coin == "USDC", date < pre_collapse) |>
+  pull(peg_dev) |>
+  na.omit()
+
+# Bootstrap the difference in means
+boot_diff <- function(data, indices) {
+  n_ust  <- length(data$ust)
+  idx_ust  <- sample(seq_len(n_ust),  size = n_ust,  replace = TRUE)
+  idx_usdc <- sample(seq_len(length(data$usdc)),
+                     size = length(data$usdc), replace = TRUE)
+  mean(data$ust[idx_ust], na.rm = TRUE) -
+    mean(data$usdc[idx_usdc], na.rm = TRUE)
+}
+
+boot_diffs <- replicate(B, {
+  mean(sample(ust_pre_vec,  replace = TRUE)) -
+    mean(sample(usdc_pre_vec, replace = TRUE))
+})
+
+diff_ci <- quantile(boot_diffs, c(0.025, 0.975))
+obs_diff <- mean(ust_pre_vec) - mean(usdc_pre_vec)
+
+message("Observed difference (UST - USDC) pre-collapse: ",
+        round(obs_diff, 6))
+message("Bootstrap 95% CI: [", round(diff_ci[1], 6),
+        ", ", round(diff_ci[2], 6), "]")
+
+if (diff_ci[1] > 0) {
+  message("CI excludes zero — the pre-collapse difference is robust.")
+  message("UST carried significantly higher peg risk than USDC")
+  message("even before the collapse, confirmed by bootstrapping.")
+} else {
+  message("CI includes zero — the pre-collapse difference is not robust.")
+}
+
+# OBSERVATION: If the bootstrap CI excludes zero, it confirms
+# that the t-test result from Section 5 is not an artifact of
+# the normality assumption. This strengthens our conclusion that
+# early warning signals were present in UST before May 2022.
+
+
+# --- 7.4 Bootstrap: Depeg Rate Per Coin ---------------------
+#
+# The depeg rate (proportion of days with peg_dev > 0.5%) is
+# a key summary statistic. We bootstrap it to get CIs for the
+# true probability of a depeg event for each coin.
+
+message("--- 7.3 Bootstrap: Depeg Rate Per Coin ---")
+
+set.seed(42)
+
+boot_rate <- function(data, indices) {
+  mean(data[indices], na.rm = TRUE)
+}
+
+depeg_boot <- master |>
+  group_by(coin) |>
+  summarise(
+    observed_rate = mean(depeg, na.rm = TRUE),
+    boot_obj      = list(
+      boot::boot(
+        data      = depeg[!is.na(depeg)],
+        statistic = boot_rate,
+        R         = B
+      )
+    )
+  ) |>
+  mutate(
+    ci_lower = sapply(boot_obj, function(b) {
+      boot::boot.ci(b, type = "perc", conf = 0.95)$percent[4]
+    }),
+    ci_upper = sapply(boot_obj, function(b) {
+      boot::boot.ci(b, type = "perc", conf = 0.95)$percent[5]
+    })
+  ) |>
+  dplyr::select(-boot_obj)
+
+message("Bootstrap 95% CIs for depeg rate:")
+print(depeg_boot |>
+        mutate(across(where(is.numeric),
+                      ~ scales::percent(., accuracy = 0.01))))
+
+# Visualize depeg rate CIs
+p8 <- ggplot(depeg_boot,
+             aes(x = coin, y = observed_rate,
+                 ymin = ci_lower, ymax = ci_upper,
+                 color = coin)) +
+  geom_pointrange(size = 0.8, linewidth = 1) +
+  scale_color_manual(values = c(
+    "USDC" = "#2563eb", "USDT" = "#16a34a",
+    "DAI"  = "#d97706", "FRAX" = "#7c3aed", "UST" = "#dc2626"
+  )) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  labs(
+    title    = "Bootstrap 95% Confidence Intervals: Depeg Rate",
+    subtitle = "2000 resamples | Percentile method",
+    x        = NULL,
+    y        = "Depeg Rate (% of days above 0.5% threshold)"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(legend.position = "none")
+
+ggsave("output/plots/08_bootstrap_ci_depeg_rate.png", p8,
+       width = 8, height = 5, dpi = 150)
+print(p8)
+
+message("Plot 8 saved: bootstrap CI for depeg rate.")
+
+# OBSERVATION: Tight CIs around USDC and USDT depeg rates
+# confirm they are reliably stable. Wide CIs around UST reflect
+# the high variability in its series — before collapse it was
+# stable, after collapse it was permanently depegged.
+
+message("Section 7 complete. Bootstrapping done.")
