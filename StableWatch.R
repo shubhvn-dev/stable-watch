@@ -2455,3 +2455,232 @@ message("Plot 13 saved: feature distributions by depeg status.")
 # their expected dominance in the XGBoost model (Section 14).
 
 message("Section 9 complete. Intermediate graphs done.")
+
+# ============================================================
+# SECTION 10 — PRINCIPAL COMPONENT ANALYSIS
+# (See Chapter 5: Principal Components and Factor Analysis)
+# ============================================================
+#
+# We have eight features in our master dataframe. PCA reduces
+# this dimensionality by finding linear combinations of features
+# (principal components) that capture the maximum variance in
+# the data. This serves two purposes here:
+#
+#   1. Understanding — which features drive the most variation
+#      in stablecoin behavior? Do macro variables and coin-level
+#      features load onto separate components (suggesting they
+#      capture different dimensions of risk)?
+#
+#   2. Visualization — projecting all coins onto a 2D space
+#      defined by PC1 and PC2 lets us see which coins cluster
+#      together and how far UST separates from the others.
+#
+# We run PCA on the standardized feature matrix (excluding the
+# UST post-collapse period to prevent it from dominating the
+# principal components).
+# ============================================================
+
+
+# --- 10.1 Prepare PCA Data ----------------------------------
+#
+# PCA requires:
+#   - No missing values (we filter rows with any NA)
+#   - Standardized features (scale = TRUE in prcomp)
+#     so that features measured in different units contribute
+#     equally to the components
+#
+# We exclude the binary depeg label and stress_event flag
+# since PCA is unsupervised — we don't want the outcome to
+# influence the component structure.
+# (See Chapter 5: Principal Components — Data Preparation)
+
+message("--- 10.1 Preparing PCA Data ---")
+
+pca_data <- master |>
+  dplyr::filter(
+    !(coin == "UST" & date >= as.Date("2022-05-09")),
+    !is.na(vol_7d),
+    !is.na(vol_30d),
+    !is.na(peg_dev_z),
+    !is.na(log_return)
+  ) |>
+  dplyr::select(
+    coin, date,
+    peg_dev, log_return, vol_7d, vol_30d,
+    peg_dev_z, dxy, sofr, vix
+  ) |>
+  na.omit()
+
+message("PCA data: ", nrow(pca_data), " rows, ",
+        n_distinct(pca_data$coin), " coins")
+
+# Extract the feature matrix (numeric columns only)
+pca_features <- pca_data |>
+  dplyr::select(peg_dev, log_return, vol_7d, vol_30d,
+                peg_dev_z, dxy, sofr, vix)
+
+
+# --- 10.2 Run PCA -------------------------------------------
+#
+# We use prcomp() with scale = TRUE to standardize all features
+# before computing principal components. This ensures features
+# measured in different units (e.g. VIX in index points vs
+# peg_dev in fractions) contribute equally to the solution.
+# (See Chapter 5: Principal Components — prcomp)
+
+message("--- 10.2 Running PCA ---")
+
+pca_result <- prcomp(pca_features, scale = TRUE, center = TRUE)
+
+message("PCA complete.")
+message("Variance explained by each component:")
+var_explained <- summary(pca_result)$importance
+print(round(var_explained, 4))
+
+
+# --- 10.3 Scree Plot ----------------------------------------
+#
+# The scree plot shows how much variance each principal
+# component explains. We look for an "elbow" — the point
+# where adding more components yields diminishing returns.
+# Components before the elbow are retained for interpretation.
+# (See Chapter 5: Principal Components — Scree Plot)
+
+message("--- 10.3 Scree Plot ---")
+
+p14 <- factoextra::fviz_eig(
+  pca_result,
+  addlabels = TRUE,
+  ylim      = c(0, 50),
+  barfill   = "#2563eb",
+  barcolor  = "white",
+  linecolor = "#dc2626",
+  ggtheme   = theme_minimal(base_size = 11)
+) +
+  labs(
+    title    = "PCA Scree Plot — Variance Explained by Component",
+    subtitle = "Bar = % variance per component | Line = cumulative variance",
+    x        = "Principal Component",
+    y        = "% Variance Explained"
+  )
+
+ggsave("output/plots/14_pca_scree_plot.png", p14,
+       width = 8, height = 5, dpi = 150)
+print(p14)
+
+message("Plot 14 saved: PCA scree plot.")
+
+# OBSERVATION: If PC1 and PC2 together explain > 50% of the
+# variance, a 2D visualization captures the dominant structure
+# in the data. We look for an elbow after PC2 or PC3 to
+# determine how many components are meaningful.
+
+
+# --- 10.4 Biplot: Observations and Variable Loadings --------
+#
+# The biplot overlays the PCA scores (observations) and
+# loadings (variables) in the same 2D space. Arrows pointing
+# in the same direction indicate positively correlated features.
+# The length of the arrow indicates the feature's contribution
+# to the displayed components.
+# (See Chapter 5: Principal Components — Biplot)
+
+message("--- 10.4 PCA Biplot ---")
+
+p15 <- factoextra::fviz_pca_biplot(
+  pca_result,
+  geom.ind     = "point",
+  pointshape   = 21,
+  pointsize    = 0.8,
+  fill.ind     = pca_data$coin,
+  col.ind      = "black",
+  alpha.ind    = 0.4,
+  col.var      = "contrib",
+  gradient.cols = c("#16a34a", "#d97706", "#dc2626"),
+  repel        = TRUE,
+  legend.title = list(fill = "Coin", color = "Contribution"),
+  ggtheme      = theme_minimal(base_size = 11)
+) +
+  labs(
+    title    = "PCA Biplot — Observations Colored by Coin",
+    subtitle = "Arrows = feature loadings | Color intensity = contribution to PC1/PC2"
+  )
+
+ggsave("output/plots/15_pca_biplot.png", p15,
+       width = 10, height = 8, dpi = 150)
+# Note: biplot is complex — saved to file, skipping inline print
+# to avoid graphics device viewport issues. See output/plots/15_pca_biplot.png
+
+message("Plot 15 saved: PCA biplot.")
+
+# OBSERVATION: UST observations should occupy a distinct region
+# of PCA space — separated from the other four coins by their
+# higher peg_dev, vol_7d, and peg_dev_z values. If the first
+# two PCs separate coins by risk profile, it confirms that
+# the features we engineered capture meaningful risk dimensions.
+
+
+# --- 10.5 Variable Loadings ---------------------------------
+#
+# We examine the loadings (eigenvectors) to understand what
+# each principal component represents. Large loadings on a
+# component mean that feature contributes heavily to that
+# dimension of variation.
+
+message("--- 10.5 Variable Loadings on PC1 and PC2 ---")
+
+loadings_df <- as.data.frame(pca_result$rotation[, 1:3]) |>
+  tibble::rownames_to_column("feature") |>
+  tidyr::pivot_longer(-feature,
+                      names_to  = "component",
+                      values_to = "loading") |>
+  dplyr::filter(component %in% c("PC1", "PC2", "PC3"))
+
+p16 <- ggplot(loadings_df,
+              aes(x = reorder(feature, abs(loading)),
+                  y = loading, fill = loading > 0)) +
+  geom_col(show.legend = FALSE) +
+  coord_flip() +
+  facet_wrap(~ component, ncol = 3) +
+  scale_fill_manual(values = c("TRUE" = "#2563eb",
+                               "FALSE" = "#dc2626")) +
+  labs(
+    title    = "PCA Variable Loadings — PC1, PC2, PC3",
+    subtitle = "Blue = positive loading | Red = negative loading",
+    x        = NULL,
+    y        = "Loading"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(strip.text = element_text(face = "bold"))
+
+ggsave("output/plots/16_pca_loadings.png", p16,
+       width = 10, height = 5, dpi = 150)
+print(p16)
+
+message("Plot 16 saved: PCA variable loadings.")
+
+# Summarize in plain text
+message("PC1 top loadings (|loading| > 0.3):")
+pca_result$rotation[, "PC1"] |>
+  abs() |>
+  sort(decreasing = TRUE) |>
+  head(4) |>
+  round(3) |>
+  print()
+
+message("PC2 top loadings (|loading| > 0.3):")
+pca_result$rotation[, "PC2"] |>
+  abs() |>
+  sort(decreasing = TRUE) |>
+  head(4) |>
+  round(3) |>
+  print()
+
+# OBSERVATION: If PC1 loads heavily on volatility features
+# (vol_7d, vol_30d, peg_dev_z) and PC2 loads on macro features
+# (dxy, sofr, vix), it suggests these two groups capture
+# separate dimensions of risk — coin-level stress vs macro
+# conditions. This would validate our feature engineering
+# approach and the two-model structure in Section 6.
+
+message("Section 10 complete. PCA done.")
