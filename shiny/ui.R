@@ -157,11 +157,14 @@ ui <- dashboardPage(
 
     hr(),
 
-    # Coin selector
-    selectInput("selected_coin", "COIN",
-                choices  = c("USDC","USDT","DAI","FRAX","UST"),
-                selected = "UST",
-                multiple = FALSE),
+    # Coin selector — only on tabs that filter by coin
+    conditionalPanel(
+      condition = "input.tabs == 'overview' || input.tabs == 'performance'",
+      selectInput("selected_coin", "COIN",
+                  choices  = c("USDC","USDT","DAI","FRAX","UST"),
+                  selected = "UST",
+                  multiple = FALSE)
+    ),
 
     # Date range
     dateRangeInput("date_range", "DATE RANGE",
@@ -171,10 +174,6 @@ ui <- dashboardPage(
                    max   = "2023-12-31"),
 
     hr(),
-
-    # Threshold slider
-    sliderInput("threshold", "ALERT THRESHOLD",
-                min = 0.1, max = 0.9, value = 0.66, step = 0.01),
 
     tags$div(
       style = "padding: 10px 15px; color: #475569; font-size: 10px; font-family: 'Space Mono', monospace; line-height: 1.6;",
@@ -263,11 +262,19 @@ ui <- dashboardPage(
       tabItem(tabName = "backtest",
 
         fluidRow(
+          box(title = "BACKTEST CONTROLS",
+              width = 12, solidHeader = FALSE,
+              tags$p(style = "color:#64748b; font-size:11px; margin-bottom:4px;",
+                     "UST only — model trained on USDC/USDT/DAI/FRAX and never saw UST data."),
+              sliderInput("threshold", "ALERT THRESHOLD",
+                          min = 0.1, max = 0.9, value = 0.66, step = 0.01,
+                          width = "400px")
+          )
+        ),
+
+        fluidRow(
           box(title = "XGBOOST PREDICTED DEPEG PROBABILITY — UST PRE-COLLAPSE",
               width = 12, solidHeader = FALSE,
-              tags$p(style = "color:#64748b; font-size:12px; margin-bottom:8px;",
-                     "Model trained on USDC/USDT/DAI/FRAX — never saw UST data.
-                      Adjust threshold slider in sidebar to change alert level."),
               plotlyOutput("backtest_plot", height = "380px"))
         ),
 

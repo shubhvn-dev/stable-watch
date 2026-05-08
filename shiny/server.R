@@ -20,17 +20,15 @@ library(pROC)
 # LOAD DATA AND MODELS
 # ============================================================
 
-# Paths — adjust if running from a different working directory
-DATA_PATH   <- "../data/processed/stablewatch_master.rds"
-MODELS_PATH <- "../output/models"
-
-# Load master dataframe
-if (file.exists(DATA_PATH)) {
-  master <- readRDS(DATA_PATH)
+# Paths — bundled for shinyapps.io; fallback for local dev
+DATA_PATH   <- if (file.exists("data/stablewatch_master.rds")) {
+  "data/stablewatch_master.rds"
 } else {
-  # Fallback: try relative paths
-  master <- readRDS("data/processed/stablewatch_master.rds")
+  "../data/processed/stablewatch_master.rds"
 }
+MODELS_PATH <- if (dir.exists("models")) "models" else "../output/models"
+
+master <- readRDS(DATA_PATH)
 
 # Load models
 load_model <- function(name) {
