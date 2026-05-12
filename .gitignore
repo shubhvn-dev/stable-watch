@@ -1,7 +1,25 @@
-data/raw/
-data/processed/
-output/models/
+# R
 .Rhistory
 .RData
 .Rproj.user
 *.Rproj
+
+# Data & models (pipeline outputs — tracked via .gitkeep only)
+data/raw/
+data/processed/
+output/models/
+
+# Shiny runtime copies (mirrors above dirs)
+shiny/data/
+shiny/models/
+
+# Shiny deployment metadata (environment-specific)
+shiny/rsconnect/
+
+# Rmd rendered outputs & cache
+*_cache/
+*_files/
+*.html
+
+# Claude Code internal
+.claude/
