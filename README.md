@@ -5,6 +5,9 @@
 
 Applies statistical modeling and machine learning to five stablecoins (USDC, USDT, DAI, FRAX, UST) over 2020–2023. Primary validation: UST collapse, May 2022 (~$40B wiped in under a week).
 
+Live on - https://shubhvn-dev.shinyapps.io/StableWatch/
+Demo - https://drive.google.com/drive/folders/1mXENbM12XQMggu2NSEo_rnWtZHBmXWPu?usp=drive_link
+
 ---
 
 ## Quickstart
